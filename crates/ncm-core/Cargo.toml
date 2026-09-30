@@ -20,6 +20,8 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 rand = { workspace = true }
+hex = { workspace = true }
+directories = { workspace = true }
 bytes = { workspace = true }
 
 md-5 = "0.11"

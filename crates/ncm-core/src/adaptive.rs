@@ -245,6 +245,8 @@ pub struct NetSnapshot {
 pub struct Limiter {
     /// Requests in flight.
     pub gate: Arc<Gate>,
+    /// Tracks being processed at once: the connection limit plus a small look-ahead.
+    pub files: Arc<Gate>,
     bytes: AtomicU64,
     errors: AtomicU32,
     limit: AtomicUsize,
@@ -257,6 +259,7 @@ impl Limiter {
         let initial = params.initial.clamp(params.min, params.max);
         Arc::new(Self {
             gate: Gate::new(initial),
+            files: Gate::new(initial + t::LOOKAHEAD_FILES),
             bytes: AtomicU64::new(0),
             errors: AtomicU32::new(0),
             limit: AtomicUsize::new(initial),
@@ -327,6 +330,7 @@ impl Limiter {
                     w.errors
                 );
                 self.gate.set_capacity(after);
+                self.files.set_capacity(after + t::LOOKAHEAD_FILES);
                 self.limit.store(after, Ordering::Relaxed);
             }
             window_start = now;

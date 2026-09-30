@@ -36,6 +36,18 @@ pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 /// A chunk that receives no bytes for this long is considered failed.
 pub const STALL_TIMEOUT: Duration = Duration::from_secs(30);
 
+// ---- pipeline structure (pending confirmation by the project owner) -------------------------
+
+/// Track ids resolved per URL request (the request also serves the following tracks).
+pub const URL_BATCH: usize = 20;
+/// Resolved URLs stay usable for a while; older entries are looked up again.
+pub const URL_CACHE_TTL: Duration = Duration::from_secs(10 * 60);
+/// How many tracks may be prepared (URL, lyrics, cover) beyond the connection limit, so that
+/// connections do not idle between files.
+pub const LOOKAHEAD_FILES: usize = 2;
+/// Attempts for a throttled API call (waits 3 s, 6 s, 12 s, ...).
+pub const API_THROTTLE_RETRIES: u32 = 4;
+
 // ---- internals of the conservative policy ---------------------------------------------------
 
 /// After the controller settles, wait this many windows before probing +1 again.
