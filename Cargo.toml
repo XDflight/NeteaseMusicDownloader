@@ -49,7 +49,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 rand = "0.9"
 hex = "0.4"
 base64 = "0.22"
-sha2 = "0.10"
+sha2 = "0.11"
 directories = "6"
 semver = "1"
 bytes = "1"
