@@ -75,7 +75,7 @@ jobs:
           Copy-Item LICENSE $dir
           Set-Content -Path "$dir\portable.flag" -Value "Delete this file to store settings under %APPDATA% instead of the data folder next to the program."
           Compress-Archive -Path "$dir\*" -DestinationPath "dist\netease-music-downloader-$env:VERSION-windows-x86_64-portable.zip"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: windows-x86_64
           path: |
@@ -108,7 +108,7 @@ jobs:
           brew install create-dmg || true
           chmod +x packaging/macos/bundle.sh
           packaging/macos/bundle.sh target/universal/netease-music-downloader "$VERSION" dist
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: macos-universal
           path: |
@@ -151,7 +151,7 @@ jobs:
       - name: Debian package
         run: |
           cargo deb --no-build -p netease-music-downloader --output "dist/netease-music-downloader-$VERSION-linux-${{ matrix.arch }}.deb"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: linux-${{ matrix.arch }}
           path: |
