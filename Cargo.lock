@@ -762,9 +762,16 @@ name = "ncm-core"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "futures-util",
+ "md-5",
+ "ncm-api",
+ "rand",
+ "reqwest",
+ "thiserror",
  "tokio",
  "tokio-util",
  "tracing",
+ "url",
 ]
 
 [[package]]
