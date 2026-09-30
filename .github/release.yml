@@ -1,0 +1,18 @@
+# Categories for the auto-generated release notes (Conventional Commit style PR titles).
+changelog:
+  exclude:
+    labels:
+      - skip-changelog
+    authors:
+      - dependabot
+  categories:
+    - title: "✨ New features"
+      labels: [feature, enhancement]
+    - title: "🐛 Fixes"
+      labels: [bug, fix]
+    - title: "🎨 Design and artwork"
+      labels: [design, art]
+    - title: "📦 Packaging and updates"
+      labels: [packaging, update]
+    - title: "🔧 Other changes"
+      labels: ["*"]

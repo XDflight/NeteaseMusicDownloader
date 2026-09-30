@@ -1,0 +1,185 @@
+name: Release
+
+# Push a tag such as v0.2.0 (it must match the version in Cargo.toml) to build every package
+# and publish a GitHub Release. "Run workflow" builds the same packages as downloadable
+# workflow artifacts without publishing anything.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Baked into the binary: the repository the in-app updater checks.
+  NMD_GITHUB_REPO: ${{ github.repository }}
+
+jobs:
+  meta:
+    name: Resolve version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      quad: ${{ steps.v.outputs.quad }}
+      prerelease: ${{ steps.v.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: v
+        shell: bash
+        run: |
+          version="$(grep -m1 '^version *= *"' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
+          echo "Cargo version: $version"
+          if [[ "$GITHUB_REF" == refs/tags/v* && "${GITHUB_REF#refs/tags/v}" != "$version" ]]; then
+            echo "::error::Tag ${GITHUB_REF#refs/tags/} does not match Cargo.toml version $version"
+            exit 1
+          fi
+          core="${version%%-*}"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "quad=$core.0" >> "$GITHUB_OUTPUT"
+          if [[ "$version" == *-* ]]; then echo "prerelease=true" >> "$GITHUB_OUTPUT"; else echo "prerelease=false" >> "$GITHUB_OUTPUT"; fi
+
+  windows:
+    name: Windows x86_64
+    needs: meta
+    runs-on: windows-latest
+    env:
+      VERSION: ${{ needs.meta.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked -p netease-music-downloader
+      - name: Install NSIS
+        shell: pwsh
+        run: |
+          choco install nsis -y --no-progress
+          "C:\Program Files (x86)\NSIS" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+      - name: Build installer
+        shell: pwsh
+        working-directory: packaging/windows
+        run: |
+          New-Item -ItemType Directory -Force "$env:GITHUB_WORKSPACE\dist" | Out-Null
+          makensis /INPUTCHARSET UTF8 `
+            "/DVERSION=$env:VERSION" "/DVERSION_QUAD=${{ needs.meta.outputs.quad }}" `
+            "/DEXE_PATH=..\..\target\release\netease-music-downloader.exe" `
+            "/DOUT_FILE=..\..\dist\netease-music-downloader-$env:VERSION-windows-x86_64-setup.exe" `
+            installer.nsi
+      - name: Build portable zip
+        shell: pwsh
+        run: |
+          $dir = "dist\portable\netease-music-downloader-$env:VERSION"
+          New-Item -ItemType Directory -Force $dir | Out-Null
+          Copy-Item target\release\netease-music-downloader.exe $dir
+          Copy-Item LICENSE $dir
+          Set-Content -Path "$dir\portable.flag" -Value "Delete this file to store settings under %APPDATA% instead of the data folder next to the program."
+          Compress-Archive -Path "$dir\*" -DestinationPath "dist\netease-music-downloader-$env:VERSION-windows-x86_64-portable.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-x86_64
+          path: |
+            dist/*-setup.exe
+            dist/*-portable.zip
+
+  macos:
+    name: macOS universal
+    needs: meta
+    runs-on: macos-latest
+    env:
+      VERSION: ${{ needs.meta.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+      - name: Build both architectures
+        run: |
+          cargo build --release --locked -p netease-music-downloader --target aarch64-apple-darwin
+          cargo build --release --locked -p netease-music-downloader --target x86_64-apple-darwin
+          mkdir -p target/universal
+          lipo -create -output target/universal/netease-music-downloader \
+            target/aarch64-apple-darwin/release/netease-music-downloader \
+            target/x86_64-apple-darwin/release/netease-music-downloader
+          lipo -info target/universal/netease-music-downloader
+      - name: Bundle, sign ad hoc, zip and build the disk image
+        run: |
+          brew install create-dmg || true
+          chmod +x packaging/macos/bundle.sh
+          packaging/macos/bundle.sh target/universal/netease-music-downloader "$VERSION" dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-universal
+          path: |
+            dist/*.zip
+            dist/*.dmg
+
+  linux:
+    name: Linux ${{ matrix.arch }}
+    needs: meta
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-22.04
+          - arch: aarch64
+            runner: ubuntu-22.04-arm
+    runs-on: ${{ matrix.runner }}
+    env:
+      VERSION: ${{ needs.meta.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: System libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config libx11-dev libxkbcommon-dev libwayland-dev libgl1-mesa-dev
+      - run: cargo build --release --locked -p netease-music-downloader
+      - name: Tarball and AppImage
+        run: |
+          sudo curl -fsSL -o /usr/local/bin/appimagetool \
+            "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-${{ matrix.arch }}.AppImage"
+          sudo chmod +x /usr/local/bin/appimagetool
+          chmod +x packaging/linux/package.sh
+          packaging/linux/package.sh "${{ matrix.arch }}" "$VERSION" target/release/netease-music-downloader dist
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deb
+      - name: Debian package
+        run: |
+          cargo deb --no-build -p netease-music-downloader --output "dist/netease-music-downloader-$VERSION-linux-${{ matrix.arch }}.deb"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-${{ matrix.arch }}
+          path: |
+            dist/*.tar.gz
+            dist/*.AppImage
+            dist/*.deb
+
+  publish:
+    name: Publish release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [meta, windows, macos, linux]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        working-directory: dist
+        run: |
+          ls -l
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          prerelease: ${{ needs.meta.outputs.prerelease == 'true' }}
+          fail_on_unmatched_files: true

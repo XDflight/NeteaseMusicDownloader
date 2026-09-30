@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Name=云音下载姬
+Name[en]=Netease Music Downloader
+GenericName=Music downloader
+GenericName[zh_CN]=音乐批量下载器
+Comment=Batch downloader for NetEase Cloud Music playlists, albums and songs
+Comment[zh_CN]=网易云音乐歌单、专辑、单曲批量下载器
+Exec=netease-music-downloader
+Icon=netease-music-downloader
+Terminal=false
+Categories=AudioVideo;Audio;Network;
+StartupWMClass=netease-music-downloader
+Keywords=music;download;netease;163;
