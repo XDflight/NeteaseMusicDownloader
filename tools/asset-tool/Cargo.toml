@@ -1,8 +1,13 @@
 [package]
 name = "asset-tool"
+description = "Turns the raw AI-generated artwork into the sprites, icons and installer images the project ships"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 publish = false
 
 [dependencies]
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "ico"] }
+icns = "0.5"
+anyhow = { workspace = true }
