@@ -1,0 +1,62 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/ncm-api",
+    "crates/ncm-core",
+    "crates/ncm-update",
+    "crates/app",
+    "tools/asset-tool",
+]
+default-members = [
+    "crates/ncm-api",
+    "crates/ncm-core",
+    "crates/ncm-update",
+    "crates/app",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+license = "AGPL-3.0-only"
+repository = "https://github.com/XDflight/NeteaseMusicDownloader"
+authors = ["XDflight"]
+
+[workspace.dependencies]
+# internal
+ncm-api = { path = "crates/ncm-api" }
+ncm-core = { path = "crates/ncm-core" }
+ncm-update = { path = "crates/ncm-update" }
+
+# async / net
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "fs", "io-util"] }
+futures-util = "0.3"
+# HTTP/2 is deliberately disabled: with h2 every chunk request would be multiplexed onto a
+# single TCP connection, which defeats parallel-connection throughput.
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "charset", "gzip", "json", "stream", "socks"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+url = "2"
+
+# serde
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# misc
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+rand = "0.9"
+hex = "0.4"
+base64 = "0.22"
+sha2 = "0.10"
+directories = "6"
+semver = "1"
+bytes = "1"
+
+[profile.release]
+opt-level = "s"
+lto = false
+
+[profile.dev.package."*"]
+opt-level = "s"
