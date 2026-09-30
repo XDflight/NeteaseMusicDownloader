@@ -1,7 +1,55 @@
 [package]
 name = "netease-music-downloader"
+description = "Batch downloader for NetEase Cloud Music playlists, albums and songs"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
+authors.workspace = true
+build = "build.rs"
+
+[[bin]]
+name = "netease-music-downloader"
+path = "src/main.rs"
 
 [dependencies]
+ncm-api = { workspace = true }
+ncm-core = { workspace = true }
+ncm-update = { workspace = true }
+tokio = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+rand = { workspace = true }
+zeroize = "1"
+
+eframe = { version = "0.35", default-features = false, features = ["glow", "default_fonts", "wayland", "x11"] }
+egui-phosphor = "0.13"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+qrcode = { version = "0.14", default-features = false }
+rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
+open = "5"
+
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
+
+[package.metadata.deb]
+name = "netease-music-downloader"
+maintainer = "XDflight <47133047+XDflight@users.noreply.github.com>"
+copyright = "2026, XDflight"
+license-file = ["../../LICENSE", "0"]
+extended-description = "Batch downloader for NetEase Cloud Music playlists, albums and songs, with adaptive concurrency, tags, cover art and time-tagged lyrics."
+section = "sound"
+priority = "optional"
+depends = "$auto, libgl1, libxkbcommon0"
+recommends = "fonts-noto-cjk"
+assets = [
+    ["target/release/netease-music-downloader", "usr/bin/", "755"],
+    ["../../packaging/linux/netease-music-downloader.desktop", "usr/share/applications/", "644"],
+    ["../../packaging/icons/png/icon-256.png", "usr/share/icons/hicolor/256x256/apps/netease-music-downloader.png", "644"],
+    ["../../packaging/icons/png/icon-128.png", "usr/share/icons/hicolor/128x128/apps/netease-music-downloader.png", "644"],
+    ["../../packaging/icons/png/icon-64.png", "usr/share/icons/hicolor/64x64/apps/netease-music-downloader.png", "644"],
+    ["../../packaging/icons/png/icon-48.png", "usr/share/icons/hicolor/48x48/apps/netease-music-downloader.png", "644"],
+    ["../../packaging/icons/png/icon-32.png", "usr/share/icons/hicolor/32x32/apps/netease-music-downloader.png", "644"],
+]
