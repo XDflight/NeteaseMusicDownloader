@@ -1,0 +1,21 @@
+# Build output
+/target/
+**/*.rs.bk
+
+# Local test/debug output
+/out/
+/dist/
+*.part
+*.log
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Local secrets — never commit real credentials
+*.credentials
+credentials.bin
+/.env
