@@ -26,6 +26,10 @@ bytes = { workspace = true }
 
 md-5 = "0.11"
 lofty = "0.25"
+aes-gcm = { version = "0.11", default-features = false, features = ["aes", "alloc"] }
+argon2 = "0.6"
+machine-uid = "0.6"
+zeroize = "1"
 
 [dev-dependencies]
 tokio = { workspace = true }
