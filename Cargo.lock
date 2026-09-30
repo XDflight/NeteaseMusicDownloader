@@ -760,6 +760,12 @@ dependencies = [
 [[package]]
 name = "ncm-core"
 version = "0.1.0"
+dependencies = [
+ "bytes",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
 
 [[package]]
 name = "ncm-update"
