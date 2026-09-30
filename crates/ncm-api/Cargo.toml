@@ -28,4 +28,4 @@ md-5 = "0.11"
 machine-uid = "0.6"
 
 [target.'cfg(windows)'.dependencies]
-windows-registry = "0.5"
+windows-registry = "0.6"
