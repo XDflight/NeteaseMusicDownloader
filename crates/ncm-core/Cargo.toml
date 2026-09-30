@@ -15,12 +15,15 @@ tokio-util = { version = "0.7", default-features = false }
 futures-util = { workspace = true }
 reqwest = { workspace = true }
 url = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 rand = { workspace = true }
 bytes = { workspace = true }
 
 md-5 = "0.11"
+lofty = "0.25"
 
 [dev-dependencies]
 tokio = { workspace = true }
