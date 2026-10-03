@@ -111,9 +111,18 @@ pub struct BatchSummary {
 
 #[derive(Debug, Clone)]
 pub enum Event {
-    Track { batch: BatchId, id: u64, update: TrackUpdate },
+    Track {
+        batch: BatchId,
+        id: u64,
+        update: TrackUpdate,
+    },
     Net(NetSnapshot),
-    BatchFinished { batch: BatchId, summary: BatchSummary },
+    BatchFinished {
+        batch: BatchId,
+        summary: BatchSummary,
+    },
+    /// Downloading was paused (`true`) or continued (`false`).
+    Paused(bool),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -205,6 +214,17 @@ impl Engine {
         id
     }
 
+    /// Pause or continue all downloads. A paused engine starts no new request or track; tracks
+    /// that are already being prepared finish what does not need the network.
+    pub fn set_paused(&self, paused: bool) {
+        self.inner.fetcher.set_paused(paused);
+        let _ = self.inner.tx.send(Event::Paused(paused));
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.inner.fetcher.is_paused()
+    }
+
     pub fn cancel_batch(&self, id: BatchId) {
         if let Some(token) = self.inner.batches.lock().unwrap().get(&id) {
             token.cancel();
@@ -283,7 +303,14 @@ impl Inner {
             let this = self.clone();
             Arc::new(move |track, update| this.emit(id, track, update))
         };
-        let summary = schedule(req.tracks, self.limiter.files.clone(), cancel, run, emit).await;
+        let resumed: Resumed = {
+            let fetcher = self.fetcher.clone();
+            Arc::new(move || {
+                let fetcher = fetcher.clone();
+                async move { fetcher.wait_resumed().await }.boxed()
+            })
+        };
+        let summary = schedule(req.tracks, self.limiter.files.clone(), cancel, resumed, run, emit).await;
         let _ = self.tx.send(Event::BatchFinished { batch: id, summary });
     }
 
@@ -565,6 +592,8 @@ impl Inner {
 type RunTrack = Arc<dyn Fn(TrackJob, Vec<u64>) -> BoxFuture<'static, Result<Finished, TrackError>> + Send + Sync>;
 /// Reports an update for the track with the given id.
 type Emit = Arc<dyn Fn(u64, TrackUpdate) + Send + Sync>;
+/// Completes when downloading is not paused.
+type Resumed = Arc<dyn Fn() -> BoxFuture<'static, ()> + Send + Sync>;
 
 /// How one track ended, for the batch summary.
 enum Outcome {
@@ -577,16 +606,26 @@ enum Outcome {
 /// Start the tracks in order, one per free start slot, and report each result the moment its
 /// task ends. Reporting from the task itself matters: a result collected only after the last
 /// track has been started would leave early tracks looking busy until the whole batch is under way.
-async fn schedule(tracks: Vec<TrackJob>, slots: Arc<Gate>, cancel: CancellationToken, run: RunTrack, emit: Emit) -> BatchSummary {
+async fn schedule(
+    tracks: Vec<TrackJob>,
+    slots: Arc<Gate>,
+    cancel: CancellationToken,
+    resumed: Resumed,
+    run: RunTrack,
+    emit: Emit,
+) -> BatchSummary {
     let all_ids: Vec<u64> = tracks.iter().map(|j| j.track.id).collect();
     let mut summary = BatchSummary { total: tracks.len(), ..BatchSummary::default() };
     let mut tasks: JoinSet<Outcome> = JoinSet::new();
     let mut pending = tracks.into_iter().enumerate();
 
-    // A start slot is only handed out when the network can use it.
+    // A start slot is only handed out when the network can use it, and not while paused.
     for (pos, job) in pending.by_ref() {
         let slot = tokio::select! {
-            s = slots.acquire() => s,
+            s = async {
+                resumed().await;
+                slots.acquire().await
+            } => s,
             _ = cancel.cancelled() => {
                 emit(job.track.id, TrackUpdate::Cancelled);
                 summary.cancelled += 1;
@@ -724,6 +763,11 @@ mod tests {
         Finished { path: PathBuf::from("a.mp3"), bytes: 10, level: "standard".into(), warnings: Vec::new() }
     }
 
+    /// A `Resumed` that never waits.
+    fn running() -> Resumed {
+        Arc::new(|| async {}.boxed())
+    }
+
     fn label(update: &TrackUpdate) -> &'static str {
         match update {
             TrackUpdate::Done { .. } => "done",
@@ -755,7 +799,7 @@ mod tests {
             let log = log.clone();
             Arc::new(move |id, update| log.lock().unwrap().push(format!("{} {id}", label(&update))))
         };
-        let summary = schedule((1..=4).map(job).collect(), Gate::new(1), CancellationToken::new(), run, emit).await;
+        let summary = schedule((1..=4).map(job).collect(), Gate::new(1), CancellationToken::new(), running(), run, emit).await;
         assert_eq!(*log.lock().unwrap(), ["start 1", "done 1", "start 2", "done 2", "start 3", "done 3", "start 4", "done 4"]);
         assert_eq!((summary.total, summary.done, summary.bytes), (4, 4, 40));
     }
@@ -777,11 +821,49 @@ mod tests {
             let seen = seen.clone();
             Arc::new(move |id, update| seen.lock().unwrap().push((id, label(&update))))
         };
-        let s = schedule((1..=3).map(job).collect(), Gate::new(3), CancellationToken::new(), run, emit).await;
+        let s = schedule((1..=3).map(job).collect(), Gate::new(3), CancellationToken::new(), running(), run, emit).await;
         assert_eq!((s.total, s.done, s.skipped, s.failed, s.cancelled), (3, 1, 1, 1, 0));
         let mut seen = seen.lock().unwrap().clone();
         seen.sort();
         assert_eq!(seen, [(1, "done"), (2, "skipped"), (3, "failed")]);
+    }
+
+    #[tokio::test]
+    async fn nothing_starts_while_paused() {
+        let (pause, rx) = tokio::sync::watch::channel(true);
+        let resumed: Resumed = Arc::new(move || {
+            let mut rx = rx.clone();
+            async move {
+                while *rx.borrow_and_update() {
+                    if rx.changed().await.is_err() {
+                        return;
+                    }
+                }
+            }
+            .boxed()
+        });
+        let started = Arc::new(Mutex::new(Vec::<u64>::new()));
+        let run: RunTrack = {
+            let started = started.clone();
+            Arc::new(move |job, _| {
+                let started = started.clone();
+                async move {
+                    started.lock().unwrap().push(job.track.id);
+                    Ok(finished())
+                }
+                .boxed()
+            })
+        };
+        let emit: Emit = Arc::new(|_, _| {});
+        let batch =
+            tokio::spawn(schedule((1..=2).map(job).collect(), Gate::new(2), CancellationToken::new(), resumed, run, emit));
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(started.lock().unwrap().is_empty(), "a paused batch must not start tracks");
+        pause.send_replace(false);
+        let s = batch.await.unwrap();
+        assert_eq!(*started.lock().unwrap(), [1, 2]);
+        assert_eq!(s.done, 2);
     }
 
     #[tokio::test]
@@ -803,7 +885,7 @@ mod tests {
             let seen = seen.clone();
             Arc::new(move |id, update| seen.lock().unwrap().push((id, label(&update))))
         };
-        let batch = tokio::spawn(schedule((1..=3).map(job).collect(), Gate::new(1), cancel.clone(), run, emit));
+        let batch = tokio::spawn(schedule((1..=3).map(job).collect(), Gate::new(1), cancel.clone(), running(), run, emit));
         tokio::time::sleep(Duration::from_millis(30)).await;
         cancel.cancel();
         let s = batch.await.unwrap();

@@ -17,7 +17,7 @@ use futures_util::StreamExt;
 use rand::Rng;
 use reqwest::StatusCode;
 use reqwest::header::{CONTENT_RANGE, RANGE};
-use tokio::sync::{Notify, oneshot};
+use tokio::sync::{Notify, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
 use crate::adaptive::{Limiter, Permit};
@@ -42,6 +42,9 @@ pub enum FetchError {
     Truncated { expected: u64, actual: u64 },
     #[error("disk error: {0}")]
     Io(String),
+    /// Downloading was paused while this request was in flight; it is not a failure.
+    #[error("paused")]
+    Paused,
 }
 
 impl From<io::Error> for FetchError {
@@ -141,6 +144,13 @@ impl FileJob {
     fn sub_progress(&self, n: u64) {
         self.downloaded.fetch_sub(n, Ordering::Relaxed);
     }
+
+    /// Tell the listener where things stand now (after progress was taken back).
+    fn report_now(&self) {
+        let now = self.downloaded.load(Ordering::Relaxed);
+        self.reported.store(now, Ordering::Relaxed);
+        (self.progress)(now.min(self.total), self.total);
+    }
 }
 
 struct Shared {
@@ -149,6 +159,7 @@ struct Shared {
     queue: Mutex<VecDeque<Arc<FileJob>>>,
     wake: Notify,
     cancel: CancellationToken,
+    pause: watch::Sender<bool>,
 }
 
 /// Cheap handle; workers stop when `cancel` (given to [`Fetcher::new`]) fires.
@@ -159,7 +170,14 @@ pub struct Fetcher {
 
 impl Fetcher {
     pub fn new(http: reqwest::Client, limiter: Arc<Limiter>, cancel: CancellationToken) -> Self {
-        let shared = Arc::new(Shared { http, limiter, queue: Mutex::new(VecDeque::new()), wake: Notify::new(), cancel });
+        let shared = Arc::new(Shared {
+            http,
+            limiter,
+            queue: Mutex::new(VecDeque::new()),
+            wake: Notify::new(),
+            cancel,
+            pause: watch::Sender::new(false),
+        });
         for _ in 0..t::MAX_CONNECTIONS {
             tokio::spawn(shared.clone().worker());
         }
@@ -168,6 +186,22 @@ impl Fetcher {
 
     pub fn limiter(&self) -> &Arc<Limiter> {
         &self.shared.limiter
+    }
+
+    /// Stop (or continue) transferring. While paused no new request is started and requests in
+    /// flight are dropped: a piece is only written once it is complete, so the part of it that had
+    /// arrived is simply fetched again after the resume.
+    pub fn set_paused(&self, paused: bool) {
+        self.shared.pause.send_replace(paused);
+    }
+
+    pub fn is_paused(&self) -> bool {
+        *self.shared.pause.borrow()
+    }
+
+    /// Returns once downloading is not paused.
+    pub async fn wait_resumed(&self) {
+        self.shared.wait_resumed().await;
     }
 
     /// Download `req.url` into `req.dest`. Falls back to a single stream when the server does
@@ -246,11 +280,13 @@ impl Fetcher {
 
     /// Whole file over one connection (used when ranges are unsupported).
     async fn stream_download(&self, req: &FetchRequest) -> Result<u64, FetchError> {
-        let mut last_err = FetchError::Stalled;
-        for attempt in 0..=t::MAX_RETRIES.min(3) {
+        let max_attempts = t::MAX_RETRIES.min(3);
+        let mut attempt = 0;
+        loop {
             if req.cancel.is_cancelled() {
                 return Err(FetchError::Cancelled);
             }
+            self.shared.resume_or_cancel(&req.cancel).await?;
             let permit = tokio::select! {
                 p = self.shared.limiter.gate.acquire() => p,
                 _ = req.cancel.cancelled() => return Err(FetchError::Cancelled),
@@ -259,17 +295,18 @@ impl Fetcher {
             drop(permit);
             match result {
                 Ok(n) => return Ok(n),
-                Err(e) if e.is_retryable() && attempt < t::MAX_RETRIES.min(3) => {
+                // A single stream cannot continue where it stopped: it starts over after the resume.
+                Err(FetchError::Paused) => {}
+                Err(e) if e.is_retryable() && attempt < max_attempts => {
                     if e.signals_congestion() {
                         self.shared.limiter.report_error();
                     }
-                    last_err = e;
                     sleep_or_cancel(backoff(attempt), &req.cancel).await?;
+                    attempt += 1;
                 }
                 Err(e) => return Err(e),
             }
         }
-        Err(last_err)
     }
 
     async fn stream_once(&self, req: &FetchRequest) -> Result<u64, FetchError> {
@@ -293,6 +330,7 @@ impl Fetcher {
             let next = tokio::select! {
                 n = tokio::time::timeout(t::STALL_TIMEOUT, stream.next()) => n,
                 _ = req.cancel.cancelled() => return Err(FetchError::Cancelled),
+                _ = self.shared.paused() => return Err(FetchError::Paused),
             };
             match next {
                 Err(_) => return Err(FetchError::Stalled),
@@ -315,6 +353,37 @@ impl Fetcher {
 }
 
 impl Shared {
+    async fn wait_resumed(&self) {
+        let mut rx = self.pause.subscribe();
+        while *rx.borrow_and_update() {
+            if rx.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+
+    /// Resolves as soon as downloading is paused.
+    async fn paused(&self) {
+        let mut rx = self.pause.subscribe();
+        loop {
+            if *rx.borrow_and_update() {
+                return;
+            }
+            if rx.changed().await.is_err() {
+                std::future::pending::<()>().await;
+            }
+        }
+    }
+
+    /// Wait for the end of a pause; `Err` when the download was cancelled meanwhile.
+    async fn resume_or_cancel(&self, cancel: &CancellationToken) -> Result<(), FetchError> {
+        tokio::select! {
+            _ = self.wait_resumed() => Ok(()),
+            _ = cancel.cancelled() => Err(FetchError::Cancelled),
+            _ = self.cancel.cancelled() => Err(FetchError::Cancelled),
+        }
+    }
+
     async fn worker(self: Arc<Self>) {
         loop {
             // Registered before we look at the queue so a push between "empty" and "wait"
@@ -323,6 +392,10 @@ impl Shared {
             tokio::pin!(notified);
             notified.as_mut().enable();
 
+            tokio::select! {
+                _ = self.wait_resumed() => {}
+                _ = self.cancel.cancelled() => return,
+            }
             let permit = tokio::select! {
                 p = self.limiter.gate.acquire() => p,
                 _ = self.cancel.cancelled() => return,
@@ -385,6 +458,11 @@ impl Shared {
             if job.cancel.is_cancelled() || job.failed.load(Ordering::SeqCst) {
                 return Err(FetchError::Cancelled);
             }
+            if *self.pause.borrow() {
+                // Do not sit on a connection permit while paused.
+                permit = None;
+                self.resume_or_cancel(&job.cancel).await?;
+            }
             let held = match permit.take() {
                 Some(p) => p,
                 None => tokio::select! {
@@ -397,6 +475,13 @@ impl Shared {
             drop(held);
             match result {
                 Ok(buf) => return Ok(buf),
+                Err(FetchError::Paused) => {
+                    // Not a failure and not an attempt: the same piece is fetched again after the
+                    // resume. What had arrived of it does not count as progress.
+                    job.sub_progress(attempt_bytes);
+                    job.report_now();
+                    self.resume_or_cancel(&job.cancel).await?;
+                }
                 Err(e) => {
                     job.sub_progress(attempt_bytes);
                     if !e.is_retryable() || attempt >= t::MAX_RETRIES {
@@ -421,6 +506,7 @@ impl Shared {
             r = tokio::time::timeout(t::STALL_TIMEOUT, send) => r.map_err(|_| FetchError::Stalled)?
                 .map_err(|e| FetchError::Network(e.to_string()))?,
             _ = job.cancel.cancelled() => return Err(FetchError::Cancelled),
+            _ = self.paused() => return Err(FetchError::Paused),
         };
         match resp.status() {
             StatusCode::PARTIAL_CONTENT => {}
@@ -436,6 +522,7 @@ impl Shared {
             let next = tokio::select! {
                 n = tokio::time::timeout(t::STALL_TIMEOUT, stream.next()) => n,
                 _ = job.cancel.cancelled() => return Err(FetchError::Cancelled),
+                _ = self.paused() => return Err(FetchError::Paused),
             };
             match next {
                 Err(_) => return Err(FetchError::Stalled),
@@ -506,7 +593,170 @@ fn write_all_at(f: &File, mut buf: &[u8], mut offset: u64) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::net::SocketAddr;
+    use std::sync::atomic::AtomicUsize;
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
     use super::*;
+
+    /// A server for one file that understands `Range`. It records the start offset of every
+    /// ranged request and answers each one after `delay`.
+    struct Mock {
+        base: String,
+        hits: Arc<Mutex<Vec<u64>>>,
+    }
+
+    async fn mock(body: Arc<Vec<u8>>, delay: Duration) -> Mock {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr: SocketAddr = listener.local_addr().unwrap();
+        let hits = Arc::new(Mutex::new(Vec::new()));
+        let log = hits.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else { return };
+                let (body, log) = (body.clone(), log.clone());
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    let mut n = 0;
+                    loop {
+                        let Ok(read) = sock.read(&mut buf[n..]).await else { return };
+                        if read == 0 {
+                            return;
+                        }
+                        n += read;
+                        if buf[..n].windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    let request = String::from_utf8_lossy(&buf[..n]).to_lowercase();
+                    let range = request.lines().find_map(|l| l.strip_prefix("range: bytes=")).and_then(|r| {
+                        let (a, b) = r.trim().split_once('-')?;
+                        Some((a.parse::<u64>().ok()?, b.parse::<u64>().ok()?))
+                    });
+                    tokio::time::sleep(delay).await;
+                    let (head, slice) = match range {
+                        Some((a, b)) => {
+                            log.lock().unwrap().push(a);
+                            let b = b.min(body.len() as u64 - 1);
+                            let head = format!(
+                                "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {a}-{b}/{}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                body.len(),
+                                b - a + 1
+                            );
+                            (head, &body[a as usize..=b as usize])
+                        }
+                        None => {
+                            (format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()), &body[..])
+                        }
+                    };
+                    let _ = sock.write_all(head.as_bytes()).await;
+                    let _ = sock.write_all(slice).await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+        Mock { base: format!("http://{addr}/file"), hits }
+    }
+
+    fn sample(len: u64) -> Arc<Vec<u8>> {
+        Arc::new((0..len).map(|i| (i % 251) as u8).collect())
+    }
+
+    /// Five full pieces and a short one.
+    fn sample_len() -> u64 {
+        t::CHUNK_SIZE * 5 + 1000
+    }
+
+    fn fetcher() -> Fetcher {
+        Fetcher::new(build_http_client(None).unwrap(), Limiter::new(), CancellationToken::new())
+    }
+
+    fn temp(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("ncm-fetch-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn request(mock: &Mock, dest: &Path, total: u64) -> FetchRequest {
+        FetchRequest {
+            url: mock.base.clone(),
+            size_hint: Some(total),
+            dest: dest.to_path_buf(),
+            progress: Arc::new(|_, _| {}),
+            cancel: CancellationToken::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn downloads_a_file_in_pieces() {
+        let body = sample(sample_len());
+        let server = mock(body.clone(), Duration::ZERO).await;
+        let dir = temp("plain");
+        let dest = dir.join("a.part");
+        let n = fetcher().download(request(&server, &dest, body.len() as u64)).await.unwrap();
+        assert_eq!(n, body.len() as u64);
+        assert_eq!(std::fs::read(&dest).unwrap(), *body);
+        assert_eq!(server.hits.lock().unwrap().len(), 6);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn pausing_stops_requests_until_resumed() {
+        let body = sample(sample_len());
+        let server = mock(body.clone(), Duration::from_millis(80)).await;
+        let dir = temp("pause");
+        let dest = dir.join("a.part");
+        let fetcher = fetcher();
+
+        // Started while paused: nothing is requested.
+        fetcher.set_paused(true);
+        assert!(fetcher.is_paused());
+        let task = tokio::spawn({
+            let (f, req) = (fetcher.clone(), request(&server, &dest, body.len() as u64));
+            async move { f.download(req).await }
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(server.hits.lock().unwrap().is_empty(), "no request may be made while paused");
+
+        // Let some requests start, then pause again: they are dropped and nothing new starts.
+        fetcher.set_paused(false);
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        fetcher.set_paused(true);
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let frozen = server.hits.lock().unwrap().len();
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(server.hits.lock().unwrap().len(), frozen, "no new request while paused");
+        assert!(!task.is_finished());
+
+        fetcher.set_paused(false);
+        let n = tokio::time::timeout(Duration::from_secs(20), task).await.expect("finishes after the resume").unwrap().unwrap();
+        assert_eq!(n, body.len() as u64);
+        assert_eq!(std::fs::read(&dest).unwrap(), *body, "the file is complete and correct");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn wait_resumed_returns_when_the_pause_ends() {
+        let fetcher = fetcher();
+        fetcher.wait_resumed().await; // not paused: immediate
+        fetcher.set_paused(true);
+        let woke = Arc::new(AtomicUsize::new(0));
+        let waiter = tokio::spawn({
+            let (f, woke) = (fetcher.clone(), woke.clone());
+            async move {
+                f.wait_resumed().await;
+                woke.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(woke.load(Ordering::SeqCst), 0);
+        fetcher.set_paused(false);
+        waiter.await.unwrap();
+        assert_eq!(woke.load(Ordering::SeqCst), 1);
+    }
 
     #[test]
     fn backoff_grows_and_is_capped() {

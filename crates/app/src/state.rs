@@ -129,6 +129,8 @@ pub struct Queue {
     pub items: Vec<QItem>,
     pub lookup: HashMap<(BatchId, u64), usize>,
     pub batches: HashMap<BatchId, BatchInfo>,
+    /// Downloading is paused (mirrors the engine).
+    pub paused: bool,
 }
 
 impl Queue {

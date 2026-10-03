@@ -58,6 +58,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("finished: {summary:?}");
                 break;
             }
+            Event::Paused(paused) => println!("  paused: {paused}"),
         }
     }
     engine.shutdown();

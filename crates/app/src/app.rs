@@ -404,6 +404,7 @@ impl App {
                     TrackUpdate::Cancelled => it.state = QState::Cancelled,
                 }
             }
+            Event::Paused(paused) => self.queue.paused = paused,
             Event::BatchFinished { batch, summary } => {
                 if let Some(b) = self.queue.batches.get_mut(&batch) {
                     b.summary = Some(summary);
