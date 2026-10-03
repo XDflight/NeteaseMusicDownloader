@@ -25,6 +25,8 @@
   - 歌词带时间轴时，**内嵌 LRC 并同时保存 `.lrc` 外挂文件**；外挂文件可改存为 `.txt` 纯文本，或仅在没有时间轴时才改存 `.txt`；可附加翻译或罗马音；支持改为内嵌纯文本。
   - 封面可内嵌，并另存为 `歌名.jpg` 或文件夹封面。
 - **自适应并发**：512 KiB 分块 Range 请求，连接数在 1～8 之间根据吞吐量自动增减，拥堵或报错时快速退让，详见 [设计说明](docs/DESIGN.md)。下载后用服务器给出的 MD5 与大小校验。
+- **暂停与续传**：可随时暂停 / 继续全部下载。每个文件旁会记录已完成的分块，程序崩溃、被关闭或断网后再次打开，会提示恢复未完成的队列，只补下载缺少的部分（完成后仍校验 MD5 与大小）。
+- **下载队列**：分为「进行中与待下载」和「已完成」两个列表；侧栏、队列页和设置页都可以一键打开下载文件夹。
 - **登录与鉴权**：与官方桌面客户端相同的 `eapi` 协议（[协议说明](docs/PROTOCOL.md)）。支持扫码（推荐）、手机号、粘贴 Cookie；登录信息以 **AES-256** 加密保存在本机，不使用系统钥匙串，可另设口令。
 - **安装与升级**：Windows 安装程序（简体中文 / English）、便携版、macOS `.dmg`、Linux AppImage / `.deb` / tar.gz；程序内**自动检查 GitHub Releases 并一键升级**（校验 SHA-256）。
 
@@ -60,7 +62,7 @@
 
 1. （可选）点左下角「登录账号」，用网易云音乐手机 App 扫码。登录后可下载会员歌曲，并看到私有歌单。
 2. 在「解析与选择」粘贴链接后回车，勾选歌曲，选好音质，点「下载选中」。
-3. 在「下载队列」查看进度；完成的歌曲点击即可在文件夹中定位。
+3. 在「下载队列」查看进度，可以暂停 / 继续；完成的歌曲会移到「已完成」列表，点击即可在文件夹中定位。
 4. 命名规则、目录结构、封面与歌词选项都在「设置」里。
 
 > 会员歌曲需要**你自己的**会员账号；本工具不会绕过付费或版权限制。未登录时会员歌曲会提示「需要登录（VIP 歌曲）」。
@@ -72,6 +74,9 @@
 | 设置 | `%APPDATA%\XDflight\NeteaseMusicDownloader\config\settings.json` |
 | 登录信息（加密） | `%LOCALAPPDATA%\XDflight\NeteaseMusicDownloader\data\credentials.bin` |
 | 日志 | `%LOCALAPPDATA%\XDflight\NeteaseMusicDownloader\data\logs\app.log` |
+| 未完成的下载队列 | `%LOCALAPPDATA%\XDflight\NeteaseMusicDownloader\data\queue.json` |
+
+下载过程中，每个文件旁边有 `歌名.扩展名.part`（数据）和 `歌名.扩展名.part.resume`（已完成的分块记录）；下载完成后自动删除。
 
 `credentials.bin` 使用 AES-256-GCM（带认证的加密，篡改会被发现）加密，密钥由 Argon2id 从「本机标识 + 可选口令」派生；文件复制到别的电脑无法解密。它能防止文件被拷走或被随手查看，**不能**防御以同一用户身份运行的恶意程序。细节见 [DESIGN.md](docs/DESIGN.md#credentials)。
 
@@ -130,6 +135,8 @@ docs/               协议说明、设计说明
 
 **会不会被封号 / 风控？** —— 这是非官方客户端，无法保证。程序尽量表现得像一个正常的桌面客户端：与官方 3.1.23 一致的请求头和 User-Agent，先领取访客令牌，设备标识稳定不变，请求带抖动地放慢，遇到限流会退避；但**不会**伪造风控令牌、破解验证码或轮换设备 ID（详见 [协议说明](docs/PROTOCOL.md#client-identity-and-behaviour)）。建议用扫码登录、一个账号只在一处使用、不要反复批量解析成千上万首歌。
 
+**下载到一半关闭或崩溃了** —— 再次打开会提示「上次有 N 首歌曲没有下载完成」，点「继续下载」即可；已下载的部分会保留，只补缺少的部分。点「取消全部」或「丢弃」则会删除未完成的文件。
+
 **下载很慢** —— 并发数由程序自动调节（1～8 条）。可在「设置 → 网络」配置代理；「下载队列」右上角能看到当前连接数与吞吐曲线。
 
 **中文显示为方块（Linux）** —— 安装 CJK 字体，例如 `sudo apt install fonts-noto-cjk`。
@@ -148,6 +155,6 @@ docs/               协议说明、设计说明
 
 ## English summary
 
-A cross-platform batch downloader for NetEase Cloud Music playlists, albums and songs, built in Rust with an egui interface. It speaks the same encrypted `eapi` protocol as the official **desktop** client, supports QR / phone / cookie login (the session is stored on disk encrypted with AES-256, without the OS keychain), lets you choose the audio quality, embeds tags, cover art and time-tagged lyrics (plus `.lrc` and cover sidecar files), and adapts the number of parallel connections (1–8, 512 KiB range chunks) to the network. Installers for Windows (NSIS), macOS (`.dmg`) and Linux (AppImage / `.deb` / tarball) are built by GitHub Actions, and the app updates itself from GitHub Releases with SHA-256 verification.
+A cross-platform batch downloader for NetEase Cloud Music playlists, albums and songs, built in Rust with an egui interface. It speaks the same encrypted `eapi` protocol as the official **desktop** client, supports QR / phone / cookie login (the session is stored on disk encrypted with AES-256, without the OS keychain), lets you choose the audio quality, embeds tags, cover art and time-tagged lyrics (plus `.lrc` and cover sidecar files), and can pause and resume downloads and continue after a crash (finished pieces are journalled next to each file), and adapts the number of parallel connections (1–8, 512 KiB range chunks) to the network. Installers for Windows (NSIS), macOS (`.dmg`) and Linux (AppImage / `.deb` / tarball) are built by GitHub Actions, and the app updates itself from GitHub Releases with SHA-256 verification.
 
 Build: `cargo build --release -p netease-music-downloader` (Rust ≥ 1.92). See [docs/PROTOCOL.md](docs/PROTOCOL.md) and [docs/DESIGN.md](docs/DESIGN.md) for the protocol and internals. VIP tracks require your own VIP account; the tool does not bypass paywalls or copyright restrictions.

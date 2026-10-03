@@ -41,6 +41,40 @@ resolve URL (batched, cached) ──► chunked download to <name>.<ext>.part �
   means the link expired while queued: the URL is fetched again once.
 * **Look-ahead.** Tracks start in order through a second gate whose size is the connection limit
   plus two, so connections do not idle while the next track resolves its URL.
+* **Results are reported by the track task itself**, the moment it ends, before it hands back its
+  start slot. The scheduler only starts tracks and builds the summary; collecting results after the
+  last track had been started would leave early tracks looking busy until the whole batch is under
+  way (`engine.rs`, `schedule`).
+* **Pause.** `Engine::set_paused` stops the workers from taking a permit or a piece, drops the
+  requests in flight and keeps the scheduler from starting tracks. A piece is only written once it
+  is complete, so dropping a request loses nothing that was on disk; its bytes are taken back out of
+  the progress and the piece is fetched again after the resume. A pause is neither a failure nor a
+  retry attempt, and the adaptive controller ignores the idle windows, so it is not mistaken for
+  congestion. A single-stream download (no `Range` support) starts over.
+
+### Continuing after an interruption
+
+Next to `<name>.<ext>.part` the fetcher keeps `<name>.<ext>.part.resume`: a header line (piece
+size, total size and a key made of track id and MD5) followed by one little-endian `u32` per finished
+piece. A task per file records finished pieces off the download path: it flushes the part file once
+for everything that finished since its last round and then appends the records, so a record never
+promises more than the file holds, a slow disk cannot hold a download back, and a half-written last
+record is ignored.
+
+When the same download starts again (after a crash, a failure or a quit) and the journal matches
+(same key, piece size and total, part file of the right length), only the missing pieces are fetched
+and progress starts at what is already there. What is continued is verified like any other download;
+if size or MD5 do not match, it is fetched once more from scratch before the track fails.
+
+A cancel by the user deletes the partial file. A quit (`Engine::shutdown`) and failures keep it.
+
+### The queue on disk
+
+`queue.json` (`ncm-core/src/queue_store.rs`) holds the batches that still have tracks to download,
+each with the options it was queued with, plus the partial files that wait to be continued. The app
+writes it when the queue changes (at most twice a second, and on exit), removes it when there is
+nothing left, and offers to continue the work after the next start. Nothing starts before the user
+decides.
 
 The numbers above are the project owner's explicit choices; they live in one file,
 `ncm-core/src/tuning.rs`.
