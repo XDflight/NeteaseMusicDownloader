@@ -147,14 +147,15 @@ fn journal_header(key: &str, total: u64) -> String {
 fn read_journal(path: &Path, header: &str, pieces: u64) -> Option<(Vec<bool>, u64)> {
     let data = std::fs::read(path).ok()?;
     let records = data.strip_prefix(header.as_bytes())?;
+    // Whole records only; a half-written last one is left out.
+    let (finished, _half_written) = records.as_chunks::<4>();
     let mut done = vec![false; pieces as usize];
-    for rec in records.chunks_exact(4) {
-        let i = u32::from_le_bytes(rec.try_into().ok()?) as usize;
-        if let Some(d) = done.get_mut(i) {
+    for rec in finished {
+        if let Some(d) = done.get_mut(u32::from_le_bytes(*rec) as usize) {
             *d = true;
         }
     }
-    Some((done, (header.len() + records.len() / 4 * 4) as u64))
+    Some((done, (header.len() + finished.len() * 4) as u64))
 }
 
 fn piece_len(index: u64, total: u64) -> u64 {
