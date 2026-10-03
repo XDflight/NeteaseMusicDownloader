@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use eframe::egui::{self, Align, Align2, Color32, CornerRadius, FontId, Layout, Margin, Rect, RichText, Sense, Stroke, Vec2};
 use ncm_api::{Account, Level, Session};
 use ncm_core::adaptive::NetSnapshot;
-use ncm_core::{AppPaths, BatchRequest, Event, SecureStore, Settings, StoreError, TrackJob, TrackUpdate};
+use ncm_core::{AppPaths, BatchRequest, Event, SavedQueue, SecureStore, Settings, StoreError, TrackJob, TrackUpdate};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use zeroize::Zeroizing;
 
@@ -42,6 +42,8 @@ pub struct App {
     pub net_history: VecDeque<f32>,
     pub mood_until: Option<(Mood, Instant)>,
     pub started: Instant,
+    /// When the unfinished queue was last written to disk.
+    queue_saved: Instant,
     pub quit_dialog: bool,
     pub force_quit: bool,
 }
@@ -130,6 +132,7 @@ impl App {
             net_history: VecDeque::new(),
             mood_until: None,
             started: Instant::now(),
+            queue_saved: Instant::now(),
             quit_dialog: false,
             force_quit: false,
         };
@@ -138,6 +141,14 @@ impl App {
         } else if let Some(a) = &app.account {
             app.browse.my = Loadable::Loading;
             app.be.load_my_playlists(a.user_id);
+        }
+        // Downloads that were interrupted (a crash, or a quit with downloads running) come back as
+        // a waiting queue: nothing starts before the user says so.
+        if let Some(saved) = SavedQueue::load(&app.paths) {
+            let n = saved.track_count();
+            app.queue.restore(saved);
+            app.page = Page::Queue;
+            app.toasts.push(ToastKind::Info, format!("上次有 {n} 首歌曲没有下载完成，已恢复到下载队列"));
         }
         app
     }
@@ -160,6 +171,25 @@ impl App {
         }
     }
 
+    /// Write the unfinished queue to disk when it changed: at most twice a second while the app
+    /// runs, and always at once when `force` is set (on exit).
+    fn save_queue(&mut self, ctx: &egui::Context, force: bool) {
+        if !self.queue.dirty {
+            return;
+        }
+        let wait = Duration::from_millis(500);
+        let since = self.queue_saved.elapsed();
+        if !force && since < wait {
+            ctx.request_repaint_after(wait - since);
+            return;
+        }
+        self.queue.dirty = false;
+        self.queue_saved = Instant::now();
+        if let Err(e) = self.queue.to_saved().save(&self.paths) {
+            self.toasts.push(ToastKind::Error, format!("保存下载队列失败：{e}"));
+        }
+    }
+
     pub fn is_logged_in(&self) -> bool {
         self.account.is_some() && self.be.api.is_logged_in()
     }
@@ -179,13 +209,14 @@ impl App {
 
     /// Rebuild client and engine (used after the proxy changes); keeps the session.
     pub fn rebuild_backend(&mut self) {
-        self.be.engine.cancel_all();
+        // A shutdown, unlike a cancel, keeps what has been downloaded so far.
         self.be.engine.shutdown();
         let session = self.be.api.session();
         let proxy = Some(self.settings.proxy.clone()).filter(|p| !p.trim().is_empty());
         match Backend::new(self.be.handle.clone(), self.tx.clone(), self.ctx.clone(), session, proxy) {
             Ok(be) => {
                 self.be = be;
+                self.queue.paused = false;
                 self.toasts.push(ToastKind::Success, "网络设置已应用");
             }
             Err(e) => self.toasts.push(ToastKind::Error, format!("网络设置无效：{e}")),
@@ -374,6 +405,7 @@ impl App {
             Event::Track { batch, id, update } => {
                 let Some(&i) = self.queue.lookup.get(&(batch, id)) else { return };
                 let it = &mut self.queue.items[i];
+                let mut ended = None;
                 match update {
                     TrackUpdate::Stage(s) => it.state = QState::Working(s),
                     TrackUpdate::Delivered { level, ext, size } => {
@@ -381,28 +413,36 @@ impl App {
                         it.quality = Some(format!("{label} · {}", ext.to_uppercase()));
                         it.total = size;
                     }
-                    TrackUpdate::PartFile(_) => {}
+                    TrackUpdate::PartFile(path) => {
+                        it.part = Some(path);
+                        self.queue.dirty = true;
+                    }
                     TrackUpdate::Progress { done, total } => {
                         it.done = done;
                         it.total = total;
                     }
                     TrackUpdate::Done { path, bytes, warnings, .. } => {
-                        it.state = QState::Done;
                         it.done = bytes;
                         it.total = bytes;
                         it.path = Some(path);
+                        it.part = None;
                         it.message = (!warnings.is_empty()).then(|| warnings.join("；"));
+                        ended = Some(QState::Done);
                     }
                     TrackUpdate::Skipped { existing } => {
-                        it.state = QState::Skipped;
                         it.path = Some(existing);
+                        it.part = None;
                         it.message = Some("文件已存在，已跳过".into());
+                        ended = Some(QState::Skipped);
                     }
                     TrackUpdate::Failed { kind, message } => {
-                        it.state = QState::Failed(kind);
                         it.message = Some(message);
+                        ended = Some(QState::Failed(kind));
                     }
-                    TrackUpdate::Cancelled => it.state = QState::Cancelled,
+                    TrackUpdate::Cancelled => ended = Some(QState::Cancelled),
+                }
+                if let Some(state) = ended {
+                    self.queue.finish(i, state);
                 }
             }
             Event::Paused(paused) => self.queue.paused = paused,
@@ -451,28 +491,25 @@ impl App {
             tracks: tracks.clone(),
             options: self.settings.download.clone(),
         };
-        let batch = self.be.engine.submit(req);
-        self.register_batch(batch, tracks);
-        self.toasts.push(ToastKind::Info, format!("已加入下载队列：{} 首", picks.len()));
+        let batch = self.be.engine.submit(req.clone());
+        self.register_batch(batch, &req);
+        let note = if self.queue.paused { "（下载已暂停，点「继续下载」开始）" } else { "" };
+        self.toasts.push(ToastKind::Info, format!("已加入下载队列：{} 首{note}", picks.len()));
     }
 
-    fn register_batch(&mut self, batch: ncm_core::BatchId, tracks: Vec<TrackJob>) {
-        self.queue.batches.insert(batch, BatchInfo { summary: None });
-        for job in tracks {
+    fn register_batch(&mut self, batch: ncm_core::BatchId, req: &BatchRequest) {
+        let meta = BatchMeta {
+            collection: req.collection.clone(),
+            collection_cover: req.collection_cover.clone(),
+            options: req.options.clone(),
+        };
+        self.queue.batches.insert(batch, BatchInfo { summary: None, meta: Some(meta) });
+        for job in &req.tracks {
             let n = self.queue.items.len();
             self.queue.lookup.insert((batch, job.track.id), n);
-            self.queue.items.push(QItem {
-                batch,
-                track: job.track,
-                index: job.index,
-                state: QState::Queued,
-                done: 0,
-                total: 0,
-                quality: None,
-                path: None,
-                message: None,
-            });
+            self.queue.items.push(QItem::new(batch, job.track.clone(), job.index));
         }
+        self.queue.dirty = true;
     }
 
     pub fn retry_failed(&mut self) {
@@ -489,14 +526,61 @@ impl App {
         let ids: std::collections::HashSet<u64> = failed.iter().map(|j| j.track.id).collect();
         self.queue.items.retain(|i| !(matches!(i.state, QState::Failed(_) | QState::Cancelled) && ids.contains(&i.track.id)));
         self.queue.lookup = self.queue.items.iter().enumerate().map(|(n, i)| ((i.batch, i.track.id), n)).collect();
+        // The partial files of the failed tracks are kept, so the retry continues them.
         let req = BatchRequest {
             collection: "重试".into(),
             collection_cover: None,
-            tracks: failed.clone(),
+            tracks: failed,
             options: self.settings.download.clone(),
         };
-        let batch = self.be.engine.submit(req);
-        self.register_batch(batch, failed);
+        let batch = self.be.engine.submit(req.clone());
+        self.register_batch(batch, &req);
+    }
+
+    /// Pause or continue all downloads.
+    pub fn toggle_pause(&mut self) {
+        let paused = !self.queue.paused;
+        self.be.engine.set_paused(paused);
+        self.queue.paused = paused;
+    }
+
+    /// Cancel everything that is running or waiting. The partial files are thrown away.
+    pub fn cancel_downloads(&mut self) {
+        for it in self.queue.items.iter_mut().filter(|i| !i.state.is_finished() && !i.is_restored()) {
+            it.part = None;
+        }
+        self.queue.dirty = true;
+        self.be.engine.cancel_all();
+    }
+
+    /// Start the queue that was restored from the previous run.
+    pub fn resume_restored(&mut self) {
+        let requests = self.queue.restored_requests();
+        if requests.is_empty() {
+            return;
+        }
+        self.be.engine.set_paused(false);
+        self.queue.paused = false;
+        for (old, req) in requests {
+            let new = self.be.engine.submit(req);
+            self.queue.rebatch(old, new);
+        }
+        self.toasts.push(ToastKind::Info, "继续下载未完成的歌曲");
+    }
+
+    /// Forget the queue that was restored from the previous run and delete its partial files.
+    pub fn discard_restored(&mut self) {
+        self.queue.discard_restored();
+        self.toasts.push(ToastKind::Info, "已丢弃未完成的下载");
+    }
+
+    /// Show the download folder in the file manager (it is created if it does not exist yet).
+    pub fn open_download_folder(&mut self) {
+        let dir = self.settings.download.output_dir.clone();
+        let _ = std::fs::create_dir_all(&dir);
+        if let Err(e) = open::that(&dir) {
+            self.toasts.push(ToastKind::Error, format!("无法打开文件夹：{e}"));
+        }
     }
 
     fn mood(&self) -> Mood {
@@ -505,7 +589,7 @@ impl App {
         {
             return m;
         }
-        if self.queue.active() > 0 {
+        if self.queue.active() > 0 && !self.queue.paused {
             Mood::Working
         } else if !self.is_logged_in() {
             Mood::Login
@@ -537,7 +621,7 @@ impl App {
             (Page::Settings, egui_phosphor::regular::SLIDERS_HORIZONTAL, "设置"),
             (Page::About, egui_phosphor::regular::HEART, "关于"),
         ] {
-            let badge = (page == Page::Queue).then(|| self.queue.active());
+            let badge = (page == Page::Queue).then(|| self.queue.active() + self.queue.restored());
             if nav_button(ui, icon, label, self.page == page, badge).clicked() {
                 self.page = page;
             }
@@ -808,6 +892,7 @@ impl eframe::App for App {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.quit_dialog = true;
         }
+        self.save_queue(ctx, false);
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
@@ -841,7 +926,10 @@ impl eframe::App for App {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        self.be.engine.cancel_all();
+        // Not a cancel: what has been downloaded stays on disk and the queue is saved, so the
+        // next start can continue where this one stopped.
+        let ctx = self.ctx.clone();
+        self.save_queue(&ctx, true);
         self.save_settings();
         self.persist_session();
         self.be.engine.shutdown();

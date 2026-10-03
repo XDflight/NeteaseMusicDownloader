@@ -373,7 +373,10 @@ impl App {
         egui::Window::new("还有任务在下载").collapsible(false).resizable(false).anchor(Align2::CENTER_CENTER, Vec2::ZERO).show(
             ctx,
             |ui| {
-                ui.label(format!("还有 {} 首歌曲没有完成，退出会中断下载（已完成的不受影响）。", self.queue.active()));
+                ui.label(format!(
+                    "还有 {} 首歌曲没有完成。退出会中断下载；已下载的部分会保留，下次启动时可以继续。",
+                    self.queue.active()
+                ));
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     if widgets::danger_button(ui, "退出").clicked() {
