@@ -10,6 +10,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use futures_util::FutureExt;
+use futures_util::future::BoxFuture;
 use md5::{Digest, Md5};
 use ncm_api::{Availability, Client, Level, SongUrl, Track};
 use tokio::runtime::Handle;
@@ -17,7 +19,7 @@ use tokio::sync::{OnceCell, mpsc};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
-use crate::adaptive::{Limiter, NetSnapshot};
+use crate::adaptive::{Gate, Limiter, NetSnapshot};
 use crate::fetch::{FetchError, FetchRequest, Fetcher, build_http_client};
 use crate::lyrics::{self, LyricsFile, PreparedLyrics};
 use crate::naming::{self, NameContext};
@@ -261,8 +263,6 @@ impl Inner {
     }
 
     async fn run_batch(self: Arc<Self>, id: BatchId, req: BatchRequest, cancel: CancellationToken) {
-        let all_ids: Vec<u64> = req.tracks.iter().map(|j| j.track.id).collect();
-        let total = req.tracks.len();
         let ctx = Arc::new(BatchCtx {
             id,
             collection: req.collection,
@@ -272,61 +272,18 @@ impl Inner {
             covers: Mutex::new(HashMap::new()),
         });
 
-        let mut tasks: JoinSet<(u64, Result<Finished, TrackError>)> = JoinSet::new();
-        let mut summary = BatchSummary { total, ..BatchSummary::default() };
-        let mut pending = req.tracks.into_iter().enumerate();
-
-        // Tracks start in order; a start slot is only handed out when the network can use it.
-        for (pos, job) in pending.by_ref() {
-            let slot = tokio::select! {
-                s = self.limiter.files.acquire() => s,
-                _ = cancel.cancelled() => {
-                    self.emit(id, job.track.id, TrackUpdate::Cancelled);
-                    summary.cancelled += 1;
-                    break;
-                }
-            };
-            let upcoming: Vec<u64> = all_ids[pos + 1..].iter().take(t::URL_BATCH).copied().collect();
+        let run: RunTrack = {
             let (this, ctx) = (self.clone(), ctx.clone());
-            tasks.spawn(async move {
-                let track_id = job.track.id;
-                let result = this.run_track(&ctx, &job, &upcoming).await;
-                drop(slot);
-                (track_id, result)
-            });
-        }
-        for (_, job) in pending {
-            self.emit(id, job.track.id, TrackUpdate::Cancelled);
-            summary.cancelled += 1;
-        }
-
-        while let Some(joined) = tasks.join_next().await {
-            let Ok((track_id, result)) = joined else { continue };
-            match result {
-                Ok(f) => {
-                    summary.done += 1;
-                    summary.bytes += f.bytes;
-                    self.emit(
-                        id,
-                        track_id,
-                        TrackUpdate::Done { path: f.path, bytes: f.bytes, level: f.level, warnings: f.warnings },
-                    );
-                }
-                Err(TrackError::Skipped(existing)) => {
-                    summary.skipped += 1;
-                    self.emit(id, track_id, TrackUpdate::Skipped { existing });
-                }
-                Err(TrackError::Cancelled) => {
-                    summary.cancelled += 1;
-                    self.emit(id, track_id, TrackUpdate::Cancelled);
-                }
-                Err(TrackError::Failed { kind, message }) => {
-                    summary.failed += 1;
-                    tracing::warn!("track {track_id} failed: {message}");
-                    self.emit(id, track_id, TrackUpdate::Failed { kind, message });
-                }
-            }
-        }
+            Arc::new(move |job, upcoming| {
+                let (this, ctx) = (this.clone(), ctx.clone());
+                async move { this.run_track(&ctx, &job, &upcoming).await }.boxed()
+            })
+        };
+        let emit: Emit = {
+            let this = self.clone();
+            Arc::new(move |track, update| this.emit(id, track, update))
+        };
+        let summary = schedule(req.tracks, self.limiter.files.clone(), cancel, run, emit).await;
         let _ = self.tx.send(Event::BatchFinished { batch: id, summary });
     }
 
@@ -604,6 +561,91 @@ impl Inner {
     }
 }
 
+/// Runs one track; `upcoming` are the ids that follow it (their URLs are resolved together).
+type RunTrack = Arc<dyn Fn(TrackJob, Vec<u64>) -> BoxFuture<'static, Result<Finished, TrackError>> + Send + Sync>;
+/// Reports an update for the track with the given id.
+type Emit = Arc<dyn Fn(u64, TrackUpdate) + Send + Sync>;
+
+/// How one track ended, for the batch summary.
+enum Outcome {
+    Done(u64),
+    Skipped,
+    Cancelled,
+    Failed,
+}
+
+/// Start the tracks in order, one per free start slot, and report each result the moment its
+/// task ends. Reporting from the task itself matters: a result collected only after the last
+/// track has been started would leave early tracks looking busy until the whole batch is under way.
+async fn schedule(tracks: Vec<TrackJob>, slots: Arc<Gate>, cancel: CancellationToken, run: RunTrack, emit: Emit) -> BatchSummary {
+    let all_ids: Vec<u64> = tracks.iter().map(|j| j.track.id).collect();
+    let mut summary = BatchSummary { total: tracks.len(), ..BatchSummary::default() };
+    let mut tasks: JoinSet<Outcome> = JoinSet::new();
+    let mut pending = tracks.into_iter().enumerate();
+
+    // A start slot is only handed out when the network can use it.
+    for (pos, job) in pending.by_ref() {
+        let slot = tokio::select! {
+            s = slots.acquire() => s,
+            _ = cancel.cancelled() => {
+                emit(job.track.id, TrackUpdate::Cancelled);
+                summary.cancelled += 1;
+                break;
+            }
+        };
+        let upcoming: Vec<u64> = all_ids[pos + 1..].iter().take(t::URL_BATCH).copied().collect();
+        let (run, emit) = (run.clone(), emit.clone());
+        tasks.spawn(async move {
+            let track_id = job.track.id;
+            let outcome = report(&emit, track_id, run(job, upcoming).await);
+            drop(slot);
+            outcome
+        });
+    }
+    for (_, job) in pending {
+        emit(job.track.id, TrackUpdate::Cancelled);
+        summary.cancelled += 1;
+    }
+
+    while let Some(joined) = tasks.join_next().await {
+        match joined {
+            Ok(Outcome::Done(bytes)) => {
+                summary.done += 1;
+                summary.bytes += bytes;
+            }
+            Ok(Outcome::Skipped) => summary.skipped += 1,
+            Ok(Outcome::Cancelled) => summary.cancelled += 1,
+            Ok(Outcome::Failed) => summary.failed += 1,
+            Err(_) => {}
+        }
+    }
+    summary
+}
+
+/// Emit the final update of a track.
+fn report(emit: &Emit, track_id: u64, result: Result<Finished, TrackError>) -> Outcome {
+    match result {
+        Ok(f) => {
+            let bytes = f.bytes;
+            emit(track_id, TrackUpdate::Done { path: f.path, bytes, level: f.level, warnings: f.warnings });
+            Outcome::Done(bytes)
+        }
+        Err(TrackError::Skipped(existing)) => {
+            emit(track_id, TrackUpdate::Skipped { existing });
+            Outcome::Skipped
+        }
+        Err(TrackError::Cancelled) => {
+            emit(track_id, TrackUpdate::Cancelled);
+            Outcome::Cancelled
+        }
+        Err(TrackError::Failed { kind, message }) => {
+            tracing::warn!("track {track_id} failed: {message}");
+            emit(track_id, TrackUpdate::Failed { kind, message });
+            Outcome::Failed
+        }
+    }
+}
+
 fn name_ctx<'a>(job: &'a TrackJob, collection: &'a str, quality: &'a str) -> NameContext<'a> {
     NameContext { track: &job.track, index: Some(job.index), collection, quality }
 }
@@ -673,6 +715,103 @@ fn verify_file(path: &Path, expected_size: u64, md5: Option<&str>) -> Result<(),
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn job(id: u64) -> TrackJob {
+        TrackJob { track: Track { id, name: format!("track {id}"), ..Track::default() }, index: id as usize }
+    }
+
+    fn finished() -> Finished {
+        Finished { path: PathBuf::from("a.mp3"), bytes: 10, level: "standard".into(), warnings: Vec::new() }
+    }
+
+    fn label(update: &TrackUpdate) -> &'static str {
+        match update {
+            TrackUpdate::Done { .. } => "done",
+            TrackUpdate::Skipped { .. } => "skipped",
+            TrackUpdate::Failed { .. } => "failed",
+            TrackUpdate::Cancelled => "cancelled",
+            _ => "other",
+        }
+    }
+
+    #[tokio::test]
+    async fn each_result_is_reported_as_soon_as_its_track_ends() {
+        // One start slot: with the old "start everything, then collect" loop every `done` line
+        // would come after the last `start`.
+        let log = Arc::new(Mutex::new(Vec::<String>::new()));
+        let run: RunTrack = {
+            let log = log.clone();
+            Arc::new(move |job, _| {
+                let log = log.clone();
+                async move {
+                    log.lock().unwrap().push(format!("start {}", job.track.id));
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    Ok(finished())
+                }
+                .boxed()
+            })
+        };
+        let emit: Emit = {
+            let log = log.clone();
+            Arc::new(move |id, update| log.lock().unwrap().push(format!("{} {id}", label(&update))))
+        };
+        let summary = schedule((1..=4).map(job).collect(), Gate::new(1), CancellationToken::new(), run, emit).await;
+        assert_eq!(*log.lock().unwrap(), ["start 1", "done 1", "start 2", "done 2", "start 3", "done 3", "start 4", "done 4"]);
+        assert_eq!((summary.total, summary.done, summary.bytes), (4, 4, 40));
+    }
+
+    #[tokio::test]
+    async fn summary_counts_every_kind_of_ending() {
+        let run: RunTrack = Arc::new(|job, _| {
+            async move {
+                match job.track.id {
+                    1 => Ok(finished()),
+                    2 => Err(TrackError::Skipped(PathBuf::from("b.mp3"))),
+                    _ => Err(TrackError::failed(FailKind::Network, "boom")),
+                }
+            }
+            .boxed()
+        });
+        let seen = Arc::new(Mutex::new(Vec::<(u64, &'static str)>::new()));
+        let emit: Emit = {
+            let seen = seen.clone();
+            Arc::new(move |id, update| seen.lock().unwrap().push((id, label(&update))))
+        };
+        let s = schedule((1..=3).map(job).collect(), Gate::new(3), CancellationToken::new(), run, emit).await;
+        assert_eq!((s.total, s.done, s.skipped, s.failed, s.cancelled), (3, 1, 1, 1, 0));
+        let mut seen = seen.lock().unwrap().clone();
+        seen.sort();
+        assert_eq!(seen, [(1, "done"), (2, "skipped"), (3, "failed")]);
+    }
+
+    #[tokio::test]
+    async fn cancelling_reports_the_running_and_the_waiting_tracks() {
+        let cancel = CancellationToken::new();
+        let run: RunTrack = {
+            let cancel = cancel.clone();
+            Arc::new(move |_, _| {
+                let cancel = cancel.clone();
+                async move {
+                    cancel.cancelled().await;
+                    Err(TrackError::Cancelled)
+                }
+                .boxed()
+            })
+        };
+        let seen = Arc::new(Mutex::new(Vec::<(u64, &'static str)>::new()));
+        let emit: Emit = {
+            let seen = seen.clone();
+            Arc::new(move |id, update| seen.lock().unwrap().push((id, label(&update))))
+        };
+        let batch = tokio::spawn(schedule((1..=3).map(job).collect(), Gate::new(1), cancel.clone(), run, emit));
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        cancel.cancel();
+        let s = batch.await.unwrap();
+        assert_eq!((s.total, s.done, s.cancelled), (3, 0, 3));
+        let mut seen = seen.lock().unwrap().clone();
+        seen.sort();
+        assert_eq!(seen, [(1, "cancelled"), (2, "cancelled"), (3, "cancelled")]);
+    }
 
     #[test]
     fn extension_prefers_reported_type_then_url() {
