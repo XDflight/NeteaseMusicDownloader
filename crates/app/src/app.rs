@@ -381,6 +381,7 @@ impl App {
                         it.quality = Some(format!("{label} · {}", ext.to_uppercase()));
                         it.total = size;
                     }
+                    TrackUpdate::PartFile(_) => {}
                     TrackUpdate::Progress { done, total } => {
                         it.done = done;
                         it.total = total;

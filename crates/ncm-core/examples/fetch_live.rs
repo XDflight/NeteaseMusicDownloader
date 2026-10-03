@@ -41,6 +41,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 dest: dest.clone(),
                 progress: Arc::new(|_, _| {}),
                 cancel: CancellationToken::new(),
+                resume: None,
             };
             let t0 = Instant::now();
             let n = fetcher.download(req).await?;

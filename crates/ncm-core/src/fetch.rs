@@ -7,8 +7,8 @@
 
 use std::collections::VecDeque;
 use std::fs::File;
-use std::io;
-use std::path::Path;
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -17,7 +17,7 @@ use futures_util::StreamExt;
 use rand::Rng;
 use reqwest::StatusCode;
 use reqwest::header::{CONTENT_RANGE, RANGE};
-use tokio::sync::{Notify, oneshot, watch};
+use tokio::sync::{Notify, mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
 use crate::adaptive::{Limiter, Permit};
@@ -100,13 +100,102 @@ pub struct FetchRequest {
     pub dest: std::path::PathBuf,
     pub progress: ProgressFn,
     pub cancel: CancellationToken,
+    /// Keep a journal of the finished pieces next to `dest` so that an interrupted download can
+    /// be continued. `None` downloads without one.
+    pub resume: Option<Resume>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Resume {
+    /// Identifies the content (for example track id and MD5). A journal written for other
+    /// content is ignored.
+    pub key: String,
+    /// Continue from an existing journal. `false` starts over (and writes a fresh journal).
+    pub reuse: bool,
+}
+
+// A journal is a header line followed by one little-endian u32 per finished piece:
+//   NMDR1 <piece size> <total size> <key>\n
+// The data of a piece is flushed to disk before its record is appended, so a record never
+// promises more than the file holds. A half-written last record is ignored.
+const JOURNAL_MAGIC: &str = "NMDR1";
+
+/// The file that records which pieces of the partial download `part` are finished.
+pub fn journal_path(part: &Path) -> PathBuf {
+    let mut p = part.as_os_str().to_owned();
+    p.push(".resume");
+    PathBuf::from(p)
+}
+
+/// Whether `part` is an interrupted download that can be continued.
+pub fn has_resume_data(part: &Path) -> bool {
+    part.is_file() && journal_path(part).is_file()
+}
+
+/// Delete a partial download together with its journal.
+pub fn discard_partial(part: &Path) {
+    let _ = std::fs::remove_file(part);
+    let _ = std::fs::remove_file(journal_path(part));
+}
+
+fn journal_header(key: &str, total: u64) -> String {
+    format!("{JOURNAL_MAGIC} {} {total} {key}\n", t::CHUNK_SIZE)
+}
+
+/// Which pieces `path` records as finished and how many bytes of it are valid, provided the
+/// journal belongs to the download described by `header`.
+fn read_journal(path: &Path, header: &str, pieces: u64) -> Option<(Vec<bool>, u64)> {
+    let data = std::fs::read(path).ok()?;
+    let records = data.strip_prefix(header.as_bytes())?;
+    let mut done = vec![false; pieces as usize];
+    for rec in records.chunks_exact(4) {
+        let i = u32::from_le_bytes(rec.try_into().ok()?) as usize;
+        if let Some(d) = done.get_mut(i) {
+            *d = true;
+        }
+    }
+    Some((done, (header.len() + records.len() / 4 * 4) as u64))
+}
+
+fn piece_len(index: u64, total: u64) -> u64 {
+    (total - index * t::CHUNK_SIZE).min(t::CHUNK_SIZE)
+}
+
+/// Record finished pieces in the journal, off the download path. Everything that finished since
+/// the last round is recorded together after one flush of the file, so a slow disk can never hold
+/// a download back, and a record is only written once the data it stands for is on disk. The task
+/// ends when the job (and with it the sender) is gone and the queue is empty.
+fn spawn_journal(file: Arc<File>, journal: File) -> mpsc::UnboundedSender<u32> {
+    let (tx, mut rx) = mpsc::unbounded_channel::<u32>();
+    let journal = Arc::new(Mutex::new(journal));
+    tokio::spawn(async move {
+        while let Some(first) = rx.recv().await {
+            let mut records = first.to_le_bytes().to_vec();
+            while let Ok(next) = rx.try_recv() {
+                records.extend_from_slice(&next.to_le_bytes());
+            }
+            let (file, journal) = (file.clone(), journal.clone());
+            let written = tokio::task::spawn_blocking(move || -> io::Result<()> {
+                file.sync_data()?;
+                journal.lock().unwrap().write_all(&records)
+            })
+            .await;
+            if !matches!(written, Ok(Ok(()))) {
+                // Only the ability to continue is lost; the download itself is unaffected.
+                tracing::warn!("cannot update the resume journal: {written:?}");
+                return;
+            }
+        }
+    });
+    tx
 }
 
 struct FileJob {
     url: String,
     total: u64,
     file: Arc<File>,
-    chunks: u64,
+    /// Pieces that still have to be fetched, in ascending order.
+    pending: Vec<u64>,
     next: AtomicU64,
     remaining: AtomicU64,
     downloaded: AtomicU64,
@@ -115,6 +204,8 @@ struct FileJob {
     done: Mutex<Option<oneshot::Sender<Result<(), FetchError>>>>,
     progress: ProgressFn,
     cancel: CancellationToken,
+    /// Finished pieces go to the journal task (see [`spawn_journal`]).
+    journal: Option<mpsc::UnboundedSender<u32>>,
 }
 
 impl FileJob {
@@ -215,22 +306,33 @@ impl Fetcher {
             },
         };
 
-        let file = Arc::new(prepare_file(&req.dest, total)?);
-        let chunks = total.div_ceil(t::CHUNK_SIZE);
+        let pieces = total.div_ceil(t::CHUNK_SIZE);
+        let prepared = prepare_file(&req.dest, total, pieces, req.resume.as_ref())?;
+        let pending: Vec<u64> = (0..pieces).filter(|&i| !prepared.done[i as usize]).collect();
+        let have: u64 = (0..pieces).filter(|&i| prepared.done[i as usize]).map(|i| piece_len(i, total)).sum();
+        if have > 0 {
+            tracing::info!("continuing {}: {have} of {total} bytes are already on disk", req.dest.display());
+            (req.progress)(have, total);
+        }
+        if pending.is_empty() {
+            return Ok(total);
+        }
         let (tx, rx) = oneshot::channel();
+        let file = Arc::new(prepared.file);
         let job = Arc::new(FileJob {
             url: req.url.clone(),
             total,
-            file,
-            chunks,
+            file: file.clone(),
+            remaining: AtomicU64::new(pending.len() as u64),
+            pending,
             next: AtomicU64::new(0),
-            remaining: AtomicU64::new(chunks),
-            downloaded: AtomicU64::new(0),
-            reported: AtomicU64::new(0),
+            downloaded: AtomicU64::new(have),
+            reported: AtomicU64::new(have),
             failed: AtomicBool::new(false),
             done: Mutex::new(Some(tx)),
             progress: req.progress.clone(),
             cancel: req.cancel.clone(),
+            journal: prepared.journal.map(|j| spawn_journal(file, j)),
         });
         self.shared.queue.lock().unwrap().push_back(job.clone());
         self.shared.wake.notify_waiters();
@@ -245,6 +347,8 @@ impl Fetcher {
             Err(FetchError::RangeUnsupported) => {
                 tracing::debug!("range unsupported, streaming {}", req.url);
                 job.failed.store(true, Ordering::SeqCst);
+                // The whole file is rewritten, so the pieces recorded so far mean nothing.
+                let _ = std::fs::remove_file(journal_path(&req.dest));
                 self.stream_download(&req).await
             }
             Err(e) => {
@@ -421,11 +525,11 @@ impl Shared {
                 q.pop_front();
                 continue;
             }
-            let idx = job.next.fetch_add(1, Ordering::SeqCst);
-            if idx >= job.chunks {
+            let pos = job.next.fetch_add(1, Ordering::SeqCst);
+            let Some(&idx) = job.pending.get(pos as usize) else {
                 q.pop_front();
                 continue;
-            }
+            };
             return Some((job, idx));
         }
     }
@@ -439,6 +543,9 @@ impl Shared {
                 let written = tokio::task::spawn_blocking(move || write_all_at(&file, &buf, start)).await;
                 match written {
                     Ok(Ok(())) => {
+                        if let Some(journal) = &job.journal {
+                            let _ = journal.send(idx as u32);
+                        }
                         if job.remaining.fetch_sub(1, Ordering::SeqCst) == 1 && !job.failed.load(Ordering::SeqCst) {
                             job.succeed();
                         }
@@ -547,13 +654,44 @@ impl Shared {
     }
 }
 
-fn prepare_file(path: &Path, len: u64) -> io::Result<File> {
+struct Prepared {
+    file: File,
+    /// `done[i]` is true when piece `i` is already in the file.
+    done: Vec<bool>,
+    journal: Option<File>,
+}
+
+/// Open the destination: an interrupted download is continued when its journal matches,
+/// otherwise the file starts over.
+fn prepare_file(path: &Path, total: u64, pieces: u64, resume: Option<&Resume>) -> io::Result<Prepared> {
+    use std::fs::OpenOptions;
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    let f = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(true).open(path)?;
-    f.set_len(len)?;
-    Ok(f)
+    let fresh = || -> io::Result<File> {
+        let f = OpenOptions::new().read(true).write(true).create(true).truncate(true).open(path)?;
+        f.set_len(total)?;
+        Ok(f)
+    };
+    let none_done = || vec![false; pieces as usize];
+    let Some(resume) = resume else { return Ok(Prepared { file: fresh()?, done: none_done(), journal: None }) };
+
+    let journal_file = journal_path(path);
+    let header = journal_header(&resume.key, total);
+    if resume.reuse
+        && let Some((done, valid_len)) = read_journal(&journal_file, &header, pieces)
+        && std::fs::metadata(path).is_ok_and(|m| m.len() == total)
+    {
+        // Cut off a half-written last record, then carry on appending.
+        OpenOptions::new().write(true).open(&journal_file)?.set_len(valid_len)?;
+        let journal = OpenOptions::new().append(true).open(&journal_file)?;
+        let file = OpenOptions::new().read(true).write(true).open(path)?;
+        return Ok(Prepared { file, done, journal: Some(journal) });
+    }
+    let file = fresh()?;
+    let mut journal = OpenOptions::new().create(true).write(true).truncate(true).open(&journal_file)?;
+    journal.write_all(header.as_bytes())?;
+    Ok(Prepared { file, done: none_done(), journal: Some(journal) })
 }
 
 fn backoff(attempt: u32) -> Duration {
@@ -687,7 +825,40 @@ mod tests {
             dest: dest.to_path_buf(),
             progress: Arc::new(|_, _| {}),
             cancel: CancellationToken::new(),
+            resume: None,
         }
+    }
+
+    fn resumable(mock: &Mock, dest: &Path, total: u64, key: &str, reuse: bool) -> FetchRequest {
+        FetchRequest { resume: Some(Resume { key: key.into(), reuse }), ..request(mock, dest, total) }
+    }
+
+    /// What an interrupted run leaves behind: a part file whose finished pieces hold the right
+    /// bytes and whose other pieces hold junk, plus a journal that lists the finished ones.
+    fn leave_partial(dest: &Path, body: &[u8], key: &str, finished: &[u32], stray: &[u8]) {
+        let mut data = vec![0xAAu8; body.len()];
+        for &i in finished {
+            let start = i as usize * t::CHUNK_SIZE as usize;
+            let end = (start + t::CHUNK_SIZE as usize).min(body.len());
+            data[start..end].copy_from_slice(&body[start..end]);
+        }
+        std::fs::write(dest, data).unwrap();
+        let mut journal = journal_header(key, body.len() as u64).into_bytes();
+        for i in finished {
+            journal.extend_from_slice(&i.to_le_bytes());
+        }
+        journal.extend_from_slice(stray);
+        std::fs::write(journal_path(dest), journal).unwrap();
+    }
+
+    fn requested(server: &Mock) -> Vec<u64> {
+        let mut v = server.hits.lock().unwrap().clone();
+        v.sort();
+        v
+    }
+
+    fn piece(i: u64) -> u64 {
+        i * t::CHUNK_SIZE
     }
 
     #[tokio::test]
@@ -735,6 +906,114 @@ mod tests {
         let n = tokio::time::timeout(Duration::from_secs(20), task).await.expect("finishes after the resume").unwrap().unwrap();
         assert_eq!(n, body.len() as u64);
         assert_eq!(std::fs::read(&dest).unwrap(), *body, "the file is complete and correct");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn continues_an_interrupted_download_from_its_journal() {
+        let body = sample(sample_len());
+        let server = mock(body.clone(), Duration::ZERO).await;
+        let dir = temp("resume");
+        let dest = dir.join("a.part");
+        // Pieces 0, 1 and 4 are on disk; the journal ends in a half-written record.
+        leave_partial(&dest, &body, "42:abc", &[0, 1, 4], &[7, 0]);
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut req = resumable(&server, &dest, body.len() as u64, "42:abc", true);
+        req.progress = {
+            let seen = seen.clone();
+            Arc::new(move |done, total| seen.lock().unwrap().push((done, total)))
+        };
+        let n = fetcher().download(req).await.unwrap();
+
+        assert_eq!(n, body.len() as u64);
+        assert_eq!(requested(&server), [piece(2), piece(3), piece(5)], "only the missing pieces are fetched");
+        assert_eq!(std::fs::read(&dest).unwrap(), *body);
+        let first = seen.lock().unwrap()[0];
+        assert_eq!(first, (3 * t::CHUNK_SIZE, body.len() as u64), "progress starts at what is already there");
+
+        // The journal now lists every piece and has no stray bytes left. It is written by a
+        // background task, so give it a moment.
+        let header = journal_header("42:abc", body.len() as u64);
+        let mut listed = None;
+        for _ in 0..100 {
+            listed = read_journal(&journal_path(&dest), &header, 6).filter(|(done, _)| done.iter().all(|d| *d));
+            if listed.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let (_, valid) = listed.expect("every piece ends up in the journal");
+        assert_eq!(valid, std::fs::metadata(journal_path(&dest)).unwrap().len());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_journal_for_other_content_is_ignored() {
+        let body = sample(sample_len());
+        let server = mock(body.clone(), Duration::ZERO).await;
+        let dir = temp("resume-other");
+        let dest = dir.join("a.part");
+        leave_partial(&dest, &body, "42:old-md5", &[0, 1, 2, 3, 4], &[]);
+        fetcher().download(resumable(&server, &dest, body.len() as u64, "42:new-md5", true)).await.unwrap();
+        assert_eq!(requested(&server).len(), 6, "everything is fetched again");
+        assert_eq!(std::fs::read(&dest).unwrap(), *body);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn starting_over_ignores_what_is_on_disk() {
+        let body = sample(sample_len());
+        let server = mock(body.clone(), Duration::ZERO).await;
+        let dir = temp("resume-fresh");
+        let dest = dir.join("a.part");
+        leave_partial(&dest, &body, "k", &[0, 1, 2, 3, 4, 5], &[]);
+        fetcher().download(resumable(&server, &dest, body.len() as u64, "k", false)).await.unwrap();
+        assert_eq!(requested(&server).len(), 6);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_part_file_of_the_wrong_size_is_not_trusted() {
+        let body = sample(sample_len());
+        let server = mock(body.clone(), Duration::ZERO).await;
+        let dir = temp("resume-size");
+        let dest = dir.join("a.part");
+        leave_partial(&dest, &body, "k", &[0, 1, 2, 3, 4, 5], &[]);
+        let truncated = std::fs::OpenOptions::new().write(true).open(&dest).unwrap();
+        truncated.set_len(1234).unwrap();
+        drop(truncated);
+        fetcher().download(resumable(&server, &dest, body.len() as u64, "k", true)).await.unwrap();
+        assert_eq!(requested(&server).len(), 6);
+        assert_eq!(std::fs::read(&dest).unwrap(), *body);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_complete_journal_needs_no_request() {
+        let body = sample(sample_len());
+        let server = mock(body.clone(), Duration::ZERO).await;
+        let dir = temp("resume-complete");
+        let dest = dir.join("a.part");
+        leave_partial(&dest, &body, "k", &[0, 1, 2, 3, 4, 5], &[]);
+        let n = fetcher().download(resumable(&server, &dest, body.len() as u64, "k", true)).await.unwrap();
+        assert_eq!(n, body.len() as u64);
+        assert!(requested(&server).is_empty());
+        assert_eq!(std::fs::read(&dest).unwrap(), *body);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_fresh_download_writes_a_journal_and_discard_removes_both_files() {
+        let body = sample(sample_len());
+        let server = mock(body.clone(), Duration::ZERO).await;
+        let dir = temp("resume-journal");
+        let dest = dir.join("a.part");
+        assert!(!has_resume_data(&dest));
+        fetcher().download(resumable(&server, &dest, body.len() as u64, "k", true)).await.unwrap();
+        assert!(has_resume_data(&dest));
+        discard_partial(&dest);
+        assert!(!dest.exists() && !journal_path(&dest).exists());
         std::fs::remove_dir_all(&dir).ok();
     }
 

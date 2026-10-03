@@ -20,7 +20,7 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 use crate::adaptive::{Gate, Limiter, NetSnapshot};
-use crate::fetch::{FetchError, FetchRequest, Fetcher, build_http_client};
+use crate::fetch::{self, FetchError, FetchRequest, Fetcher, Resume, build_http_client};
 use crate::lyrics::{self, LyricsFile, PreparedLyrics};
 use crate::naming::{self, NameContext};
 use crate::options::{CoverFile, DownloadOptions, ExistsPolicy};
@@ -79,6 +79,9 @@ pub enum TrackUpdate {
         ext: String,
         size: u64,
     },
+    /// The partial file the track is downloaded into. It stays behind when the download is
+    /// interrupted, so that it can be continued later.
+    PartFile(PathBuf),
     Progress {
         done: u64,
         total: u64,
@@ -225,19 +228,22 @@ impl Engine {
         self.inner.fetcher.is_paused()
     }
 
+    /// Cancel a batch. What was downloaded of its unfinished tracks is discarded.
     pub fn cancel_batch(&self, id: BatchId) {
         if let Some(token) = self.inner.batches.lock().unwrap().get(&id) {
             token.cancel();
         }
     }
 
+    /// Cancel every batch (see [`Engine::cancel_batch`]).
     pub fn cancel_all(&self) {
         for token in self.inner.batches.lock().unwrap().values() {
             token.cancel();
         }
     }
 
-    /// Stop all background tasks; the engine cannot be used afterwards.
+    /// Stop all background tasks; the engine cannot be used afterwards. Unlike a cancel, this
+    /// keeps the partial files, so the downloads can be continued by a later engine.
     pub fn shutdown(&self) {
         self.inner.root.cancel();
     }
@@ -363,29 +369,49 @@ impl Inner {
         let cover_url = track.album.pic_url.as_deref().map(|u| opts.cover_size.apply(u));
         let want_cover = opts.embed_cover || opts.cover_file != CoverFile::Off;
 
+        self.emit(batch, track.id, TrackUpdate::PartFile(part_path.clone()));
+
+        // What an earlier run left behind (a crash, a failure, a quit) is continued. It is checked
+        // like any other download, and a file that does not verify is fetched once more from
+        // scratch before the track is given up.
+        let resume_key = format!("{}:{}", track.id, song.md5.as_deref().unwrap_or_default());
+        let mut reuse = fetch::has_resume_data(&part_path);
         stage(Stage::Downloading);
-        let bytes = match self.download(ctx, track, &mut song, &part_path, upcoming).await {
-            Ok(n) => n,
-            Err(e) => {
-                let _ = tokio::fs::remove_file(&part_path).await;
-                if let Some(h) = lyrics_task {
-                    h.abort();
+        let bytes = loop {
+            let resume = Resume { key: resume_key.clone(), reuse };
+            let n = match self.download(ctx, track, &mut song, &part_path, upcoming, resume).await {
+                Ok(n) => n,
+                Err(e) => {
+                    if let Some(h) = lyrics_task {
+                        h.abort();
+                    }
+                    // Only a cancel by the user throws the partial file away. A quit (the engine's
+                    // root token) and a failure keep it, so the download can be continued.
+                    if matches!(e, TrackError::Cancelled) && !self.root.is_cancelled() {
+                        fetch::discard_partial(&part_path);
+                    }
+                    return Err(e);
                 }
-                return Err(e);
+            };
+
+            stage(Stage::Verifying);
+            let (verify_path, size, md5) = (part_path.clone(), song.size, song.md5.clone());
+            let verified = tokio::task::spawn_blocking(move || verify_file(&verify_path, size, md5.as_deref())).await;
+            match verified {
+                Ok(Ok(())) => break n,
+                Ok(Err(msg)) => {
+                    fetch::discard_partial(&part_path);
+                    if reuse {
+                        tracing::warn!("{} did not verify after a resume ({msg}); downloading it again", track.id);
+                        reuse = false;
+                        stage(Stage::Downloading);
+                        continue;
+                    }
+                    return Err(TrackError::failed(FailKind::Network, msg));
+                }
+                Err(e) => return Err(TrackError::failed(FailKind::Other, e.to_string())),
             }
         };
-
-        stage(Stage::Verifying);
-        let (verify_path, size, md5) = (part_path.clone(), song.size, song.md5.clone());
-        let verified = tokio::task::spawn_blocking(move || verify_file(&verify_path, size, md5.as_deref())).await;
-        match verified {
-            Ok(Ok(())) => {}
-            Ok(Err(msg)) => {
-                let _ = tokio::fs::remove_file(&part_path).await;
-                return Err(TrackError::failed(FailKind::Network, msg));
-            }
-            Err(e) => return Err(TrackError::failed(FailKind::Other, e.to_string())),
-        }
 
         let mut warnings = Vec::new();
         let prepared = match lyrics_task {
@@ -442,6 +468,7 @@ impl Inner {
         tokio::fs::rename(&part_path, &final_path)
             .await
             .map_err(|e| TrackError::failed(FailKind::Disk, format!("无法保存文件：{e}")))?;
+        let _ = tokio::fs::remove_file(fetch::journal_path(&part_path)).await;
 
         // Sidecar files: never fatal.
         if let Some((ext, text)) = prepared.as_ref().and_then(|p| p.sidecar(opts.lyrics_file))
@@ -501,6 +528,7 @@ impl Inner {
         song: &mut SongUrl,
         dest: &Path,
         upcoming: &[u64],
+        resume: Resume,
     ) -> Result<u64, TrackError> {
         for attempt in 0..2 {
             let (tx, batch, id) = (self.tx.clone(), ctx.id, track.id);
@@ -512,6 +540,8 @@ impl Inner {
                     let _ = tx.send(Event::Track { batch, id, update: TrackUpdate::Progress { done, total } });
                 }),
                 cancel: ctx.cancel.clone(),
+                // After an expired link the pieces fetched so far are good, whatever was asked.
+                resume: Some(Resume { reuse: resume.reuse || attempt > 0, ..resume.clone() }),
             };
             match self.fetcher.download(req).await {
                 Ok(n) => return Ok(n),
