@@ -14,6 +14,7 @@ use futures_util::FutureExt;
 use futures_util::future::BoxFuture;
 use md5::{Digest, Md5};
 use ncm_api::{Availability, Client, Level, SongUrl, Track};
+use serde::{Deserialize, Serialize};
 use tokio::runtime::Handle;
 use tokio::sync::{OnceCell, mpsc};
 use tokio::task::JoinSet;
@@ -32,14 +33,14 @@ pub type BatchId = u64;
 
 // ------------------------------------------------------------------------------- public API
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrackJob {
     pub track: Track,
     /// 1-based position in the source collection (for `{index}`).
     pub index: usize,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BatchRequest {
     /// Name of the playlist / album (used for the folder and `{playlist}`).
     pub collection: String,

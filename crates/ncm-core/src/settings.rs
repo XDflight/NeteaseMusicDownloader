@@ -10,6 +10,7 @@ use crate::fsutil::write_atomic;
 use crate::options::DownloadOptions;
 
 const SETTINGS_FILE: &str = "settings.json";
+const QUEUE_FILE: &str = "queue.json";
 const PORTABLE_MARKER: &str = "portable.flag";
 
 #[derive(Debug, Clone)]
@@ -36,6 +37,11 @@ impl AppPaths {
 
     pub fn settings_file(&self) -> PathBuf {
         self.config_dir.join(SETTINGS_FILE)
+    }
+
+    /// The unfinished download queue (see `queue_store`).
+    pub fn queue_file(&self) -> PathBuf {
+        self.data_dir.join(QUEUE_FILE)
     }
 }
 
