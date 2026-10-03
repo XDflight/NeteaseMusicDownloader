@@ -82,7 +82,7 @@
 
 ## 从源码构建
 
-需要 Rust 1.92 或更新版本（`edition = "2024"`）。Linux 需要 `libx11-dev libxkbcommon-dev libwayland-dev libgl1-mesa-dev`。
+需要 Rust 1.95 或更新版本（`edition = "2024"`）。Linux 需要 `libx11-dev libxkbcommon-dev libwayland-dev libgl1-mesa-dev`。
 
 ```bash
 cargo run -p netease-music-downloader            # 调试运行
@@ -157,4 +157,4 @@ docs/               协议说明、设计说明
 
 A cross-platform batch downloader for NetEase Cloud Music playlists, albums and songs, built in Rust with an egui interface. It speaks the same encrypted `eapi` protocol as the official **desktop** client, supports QR / phone / cookie login (the session is stored on disk encrypted with AES-256, without the OS keychain), lets you choose the audio quality, embeds tags, cover art and time-tagged lyrics (plus `.lrc` and cover sidecar files), and can pause and resume downloads and continue after a crash (finished pieces are journalled next to each file), and adapts the number of parallel connections (1–8, 512 KiB range chunks) to the network. Installers for Windows (NSIS), macOS (`.dmg`) and Linux (AppImage / `.deb` / tarball) are built by GitHub Actions, and the app updates itself from GitHub Releases with SHA-256 verification.
 
-Build: `cargo build --release -p netease-music-downloader` (Rust ≥ 1.92). See [docs/PROTOCOL.md](docs/PROTOCOL.md) and [docs/DESIGN.md](docs/DESIGN.md) for the protocol and internals. VIP tracks require your own VIP account; the tool does not bypass paywalls or copyright restrictions.
+Build: `cargo build --release -p netease-music-downloader` (Rust ≥ 1.95). See [docs/PROTOCOL.md](docs/PROTOCOL.md) and [docs/DESIGN.md](docs/DESIGN.md) for the protocol and internals. VIP tracks require your own VIP account; the tool does not bypass paywalls or copyright restrictions.
