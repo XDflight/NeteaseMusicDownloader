@@ -25,7 +25,7 @@ jobs:
       quad: ${{ steps.v.outputs.quad }}
       prerelease: ${{ steps.v.outputs.prerelease }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - id: v
         shell: bash
         run: |
@@ -47,7 +47,7 @@ jobs:
     env:
       VERSION: ${{ needs.meta.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release --locked -p netease-music-downloader
@@ -75,7 +75,7 @@ jobs:
           Copy-Item LICENSE $dir
           Set-Content -Path "$dir\portable.flag" -Value "Delete this file to store settings under %APPDATA% instead of the data folder next to the program."
           Compress-Archive -Path "$dir\*" -DestinationPath "dist\netease-music-downloader-$env:VERSION-windows-x86_64-portable.zip"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: windows-x86_64
           path: |
@@ -89,7 +89,7 @@ jobs:
     env:
       VERSION: ${{ needs.meta.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-darwin,x86_64-apple-darwin
@@ -108,7 +108,7 @@ jobs:
           brew install create-dmg || true
           chmod +x packaging/macos/bundle.sh
           packaging/macos/bundle.sh target/universal/netease-music-downloader "$VERSION" dist
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: macos-universal
           path: |
@@ -130,7 +130,7 @@ jobs:
     env:
       VERSION: ${{ needs.meta.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: System libraries
@@ -151,7 +151,7 @@ jobs:
       - name: Debian package
         run: |
           cargo deb --no-build -p netease-music-downloader --output "dist/netease-music-downloader-$VERSION-linux-${{ matrix.arch }}.deb"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: linux-${{ matrix.arch }}
           path: |
@@ -167,7 +167,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
@@ -177,7 +177,7 @@ jobs:
           ls -l
           sha256sum * > SHA256SUMS.txt
           cat SHA256SUMS.txt
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           files: dist/*
           generate_release_notes: true
