@@ -626,6 +626,10 @@ impl App {
                 self.page = page;
             }
         }
+        // Not a page but an action, so it can be reached from anywhere.
+        if nav_button(ui, egui_phosphor::regular::FOLDER_OPEN, "打开下载文件夹", false, None).clicked() {
+            self.open_download_folder();
+        }
 
         // Account card pinned to the bottom, mascot stage in the space above it.
         let region = ui.available_rect_before_wrap();

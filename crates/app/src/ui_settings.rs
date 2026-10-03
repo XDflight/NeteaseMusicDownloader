@@ -60,11 +60,14 @@ impl App {
             ui.label("保存位置");
             ui.horizontal(|ui| {
                 let mut text = self.settings.download.output_dir.display().to_string();
-                if ui.add(egui::TextEdit::singleline(&mut text).desired_width(ui.available_width() - 100.0)).changed() {
+                if ui.add(egui::TextEdit::singleline(&mut text).desired_width(ui.available_width() - 190.0)).changed() {
                     self.settings.download.output_dir = text.into();
                 }
                 if secondary_button(ui, "浏览…").clicked() {
                     self.be.pick_folder(self.settings.download.output_dir.clone());
+                }
+                if secondary_button(ui, format!("{} 打开", egui_phosphor::regular::FOLDER_OPEN)).clicked() {
+                    self.open_download_folder();
                 }
             });
             let d = &mut self.settings.download;
