@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures_util::StreamExt;
-use rand::Rng;
+use rand::RngExt;
 use reqwest::StatusCode;
 use reqwest::header::{CONTENT_RANGE, RANGE};
 use tokio::sync::{Notify, mpsc, oneshot, watch};

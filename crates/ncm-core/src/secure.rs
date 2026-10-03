@@ -19,7 +19,7 @@ use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
 use argon2::{Algorithm, Argon2, Params, Version};
 use ncm_api::Session;
-use rand::RngCore;
+use rand::Rng;
 use zeroize::Zeroizing;
 
 use crate::fsutil::write_atomic;

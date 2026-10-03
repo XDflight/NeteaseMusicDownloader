@@ -9,7 +9,7 @@ use std::time::Duration;
 use eframe::egui;
 use ncm_api::{Account, Client, ClientOptions, Collection, LoginSecret, PlaylistSummary, QrState, ResourceKind, Session};
 use ncm_core::{Engine, Event, tuning};
-use rand::Rng;
+use rand::RngExt;
 use tokio::runtime::Handle;
 use tokio::sync::mpsc::UnboundedSender;
 

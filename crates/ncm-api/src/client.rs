@@ -2,7 +2,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Once, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use rand::Rng;
+use rand::RngExt;
 use reqwest::header::{CONTENT_TYPE, COOKIE, SET_COOKIE};
 use serde_json::{Map, Value, json};
 use tokio::sync::Mutex;

@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use rand::Rng;
+use rand::RngExt;
 use serde::{Deserialize, Serialize};
 
 /// Cookies that carry (or refresh) the login state. Everything else the server sets is noise.
