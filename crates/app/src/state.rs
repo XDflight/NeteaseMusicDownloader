@@ -64,6 +64,14 @@ impl CollectionView {
     }
 }
 
+/// The thumbnail on a card of "my playlists".
+pub enum CoverState {
+    Loading,
+    Ready(TextureHandle),
+    /// Could not be downloaded or decoded; the card keeps its icon until the list is loaded again.
+    Failed,
+}
+
 pub struct Browse {
     pub input: String,
     pub bare_kind: ResourceKind,
@@ -71,8 +79,19 @@ pub struct Browse {
     pub error: Option<String>,
     pub view: Option<CollectionView>,
     pub my: Loadable<Vec<PlaylistSummary>>,
+    /// Covers of "my playlists" by playlist id.
+    pub my_covers: HashMap<u64, CoverState>,
     /// Guards against a slow response overwriting a newer one.
     pub request_seq: u64,
+}
+
+impl Browse {
+    /// Put a freshly loaded list of "my playlists" in place. Covers of playlists that are gone are
+    /// forgotten and covers that failed are tried again.
+    pub fn set_my(&mut self, list: Vec<PlaylistSummary>) {
+        self.my_covers.retain(|id, state| !matches!(state, CoverState::Failed) && list.iter().any(|p| p.id == *id));
+        self.my = Loadable::Ready(list);
+    }
 }
 
 impl Default for Browse {
@@ -84,6 +103,7 @@ impl Default for Browse {
             error: None,
             view: None,
             my: Loadable::Idle,
+            my_covers: HashMap::new(),
             request_seq: 0,
         }
     }
@@ -454,6 +474,26 @@ mod tests {
         assert_eq!(again.restored(), 2);
         assert_eq!(again.items[1].track.id, 11);
         assert_eq!(again.items[1].part.as_deref(), Some(Path::new("x.part")));
+    }
+
+    #[test]
+    fn reloading_my_playlists_keeps_good_covers_and_retries_failed_ones() {
+        let playlist = |id| PlaylistSummary { id, ..PlaylistSummary::default() };
+        let ctx = eframe::egui::Context::default();
+        let texture = ctx.load_texture("t", eframe::egui::ColorImage::example(), eframe::egui::TextureOptions::LINEAR);
+
+        let mut browse = Browse::default();
+        browse.my_covers.insert(1, CoverState::Ready(texture));
+        browse.my_covers.insert(2, CoverState::Failed);
+        browse.my_covers.insert(3, CoverState::Loading);
+        browse.my_covers.insert(4, CoverState::Failed);
+        // 3 is gone from the new list; 2 and 4 stay but failed before.
+        browse.set_my(vec![playlist(1), playlist(2), playlist(4)]);
+
+        assert!(matches!(browse.my_covers.get(&1), Some(CoverState::Ready(_))), "a loaded cover stays");
+        assert!(!browse.my_covers.contains_key(&2) && !browse.my_covers.contains_key(&4), "failed ones are asked for again");
+        assert!(!browse.my_covers.contains_key(&3), "a playlist that is gone loses its cover");
+        assert!(matches!(&browse.my, Loadable::Ready(l) if l.len() == 3));
     }
 
     #[test]

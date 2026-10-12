@@ -104,6 +104,8 @@ impl App {
 
         widgets::section_title(ui, egui_phosphor::regular::HEADPHONES, "我的歌单");
         let mut open: Option<u64> = None;
+        // Covers to fetch: the cards that are on screen and have not asked for theirs yet.
+        let mut want_covers: Vec<(u64, String)> = Vec::new();
         match &self.browse.my {
             Loadable::Idle if !logged_in => widgets::hint(ui, "登录后，这里会列出你创建和收藏的所有歌单（包括私有歌单）。"),
             Loadable::Idle | Loadable::Loading => {
@@ -123,8 +125,19 @@ impl App {
                     for row in list.chunks(cols) {
                         ui.horizontal(|ui| {
                             for pl in row {
-                                if playlist_card(ui, pl, card_w) {
+                                let cover = match self.browse.my_covers.get(&pl.id) {
+                                    Some(CoverState::Ready(tex)) => Some(tex),
+                                    _ => None,
+                                };
+                                let (clicked, visible) = playlist_card(ui, pl, card_w, cover);
+                                if clicked {
                                     open = Some(pl.id);
+                                }
+                                if let Some(url) = &pl.cover_url
+                                    && visible
+                                    && !self.browse.my_covers.contains_key(&pl.id)
+                                {
+                                    want_covers.push((pl.id, thumbnail_url(url, COVER_THUMB_PX)));
                                 }
                             }
                         });
@@ -134,6 +147,10 @@ impl App {
                     }
                 });
             }
+        }
+        for (id, url) in want_covers {
+            self.browse.my_covers.insert(id, CoverState::Loading);
+            self.be.fetch_playlist_cover(id, url);
         }
         if let Some(id) = open {
             self.browse.request_seq += 1;
@@ -271,8 +288,20 @@ impl App {
     }
 }
 
-fn playlist_card(ui: &mut egui::Ui, pl: &PlaylistSummary, width: f32) -> bool {
+/// Edge length of the cover thumbnails requested from the image server: the card shows them at
+/// 44 points, so this stays sharp on high-density screens.
+const COVER_THUMB_PX: u32 = 120;
+
+/// The image server resizes on request: `url` with its size parameter replaced.
+fn thumbnail_url(url: &str, px: u32) -> String {
+    let base = url.split('?').next().unwrap_or(url);
+    format!("{base}?param={px}y{px}")
+}
+
+/// One card of "my playlists". Returns whether it was clicked and whether it is on screen.
+fn playlist_card(ui: &mut egui::Ui, pl: &PlaylistSummary, width: f32, cover: Option<&egui::TextureHandle>) -> (bool, bool) {
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 68.0), Sense::click());
+    let visible = ui.is_rect_visible(rect);
     let p = pal(ui);
     let hovered = resp.hovered();
     ui.painter().rect(
@@ -283,15 +312,40 @@ fn playlist_card(ui: &mut egui::Ui, pl: &PlaylistSummary, width: f32) -> bool {
         egui::StrokeKind::Inside,
     );
     let icon_rect = Rect::from_min_size(rect.min + Vec2::new(12.0, 12.0), Vec2::splat(44.0));
-    ui.painter().rect_filled(icon_rect, CornerRadius::same(12), if pl.special_type == 5 { ACCENT } else { p.card_alt });
-    let icon = if pl.special_type == 5 { egui_phosphor::regular::HEART } else { egui_phosphor::regular::MUSIC_NOTES };
-    ui.painter().text(
-        icon_rect.center(),
-        Align2::CENTER_CENTER,
-        icon,
-        FontId::proportional(22.0),
-        if pl.special_type == 5 { Color32::WHITE } else { ACCENT_DEEP },
-    );
+    let liked = pl.special_type == 5;
+    match cover {
+        Some(tex) => {
+            egui::Image::new(tex)
+                .fit_to_exact_size(icon_rect.size())
+                .corner_radius(CornerRadius::same(12))
+                .paint_at(ui, icon_rect);
+            if liked {
+                // The "liked songs" list keeps its heart as a badge on the cover.
+                let badge = icon_rect.right_bottom() - Vec2::splat(5.0);
+                ui.painter().circle_filled(badge, 9.0, ACCENT);
+                ui.painter().circle_stroke(badge, 9.0, Stroke::new(1.5, p.card));
+                ui.painter().text(
+                    badge,
+                    Align2::CENTER_CENTER,
+                    egui_phosphor::regular::HEART,
+                    FontId::proportional(11.0),
+                    Color32::WHITE,
+                );
+            }
+        }
+        // No cover yet (still loading, failed, or the playlist has none): the icon.
+        None => {
+            ui.painter().rect_filled(icon_rect, CornerRadius::same(12), if liked { ACCENT } else { p.card_alt });
+            let icon = if liked { egui_phosphor::regular::HEART } else { egui_phosphor::regular::MUSIC_NOTES };
+            ui.painter().text(
+                icon_rect.center(),
+                Align2::CENTER_CENTER,
+                icon,
+                FontId::proportional(22.0),
+                if liked { Color32::WHITE } else { ACCENT_DEEP },
+            );
+        }
+    }
     let text_x = icon_rect.right() + 12.0;
     let name = elide(ui, &pl.name, FontId::proportional(15.0), p.text, rect.right() - text_x - 12.0);
     ui.painter().galley(egui::pos2(text_x, rect.top() + 13.0), name, p.text);
@@ -304,7 +358,7 @@ fn playlist_card(ui: &mut egui::Ui, pl: &PlaylistSummary, width: f32) -> bool {
     }
     let sub = elide(ui, &sub, FontId::proportional(12.0), p.muted, rect.right() - text_x - 12.0);
     ui.painter().galley(egui::pos2(text_x, rect.top() + 38.0), sub, p.muted);
-    resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
+    (resp.on_hover_cursor(egui::CursorIcon::PointingHand).clicked(), visible)
 }
 
 /// One-line text that ends in an ellipsis when it does not fit `width`.
@@ -439,5 +493,17 @@ fn availability_color(t: &Track, logged_in: bool) -> Option<Color32> {
         Availability::Ok => None,
         Availability::VipRequired if logged_in => None,
         _ => Some(theme::BAD),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::thumbnail_url;
+
+    #[test]
+    fn thumbnails_replace_any_existing_size_parameter() {
+        let plain = "https://p1.music.126.net/abc==/123.jpg";
+        assert_eq!(thumbnail_url(plain, 120), "https://p1.music.126.net/abc==/123.jpg?param=120y120");
+        assert_eq!(thumbnail_url(&format!("{plain}?param=500y500"), 120), "https://p1.music.126.net/abc==/123.jpg?param=120y120");
     }
 }

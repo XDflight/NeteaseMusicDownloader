@@ -44,6 +44,11 @@ pub enum UiMsg {
         url: String,
         bytes: Option<Vec<u8>>,
     },
+    /// The small cover of a card in "my playlists".
+    PlaylistCover {
+        id: u64,
+        bytes: Option<Vec<u8>>,
+    },
     Login {
         generation: u64,
         msg: LoginMsg,
@@ -146,13 +151,23 @@ impl Backend {
     }
 
     pub fn fetch_cover(&self, url: String) {
+        let key = url.clone();
+        self.fetch_image(url, move |bytes| UiMsg::Cover { url: key, bytes });
+    }
+
+    pub fn fetch_playlist_cover(&self, id: u64, url: String) {
+        self.fetch_image(url, move |bytes| UiMsg::PlaylistCover { id, bytes });
+    }
+
+    /// Download an image (`None` when that fails) and hand it to the UI as the message `wrap` builds.
+    fn fetch_image(&self, url: String, wrap: impl FnOnce(Option<Vec<u8>>) -> UiMsg + Send + 'static) {
         let http = self.api.http().clone();
         self.spawn(async move {
             let bytes = match http.get(&url).timeout(Duration::from_secs(20)).send().await {
                 Ok(r) if r.status().is_success() => r.bytes().await.ok().map(|b| b.to_vec()),
                 _ => None,
             };
-            UiMsg::Cover { url, bytes }
+            wrap(bytes)
         });
     }
 

@@ -203,6 +203,7 @@ impl App {
         self.be.api.sign_out_local();
         self.account = None;
         self.browse.my = Loadable::Idle;
+        self.browse.my_covers.clear();
         self.persist_session();
         self.toasts.push(ToastKind::Info, "已退出登录");
     }
@@ -252,7 +253,7 @@ impl App {
                 tracing::warn!("could not verify the saved login: {e}");
                 self.toasts.push(ToastKind::Warning, "暂时无法验证登录状态（网络问题？），已沿用保存的登录");
             }
-            UiMsg::MyPlaylists(Ok(list)) => self.browse.my = Loadable::Ready(list),
+            UiMsg::MyPlaylists(Ok(list)) => self.browse.set_my(list),
             UiMsg::MyPlaylists(Err(e)) => self.browse.my = Loadable::Failed(e),
             UiMsg::Collection { seq, result } => {
                 if seq != self.browse.request_seq {
@@ -276,16 +277,13 @@ impl App {
             UiMsg::Cover { url, bytes } => {
                 if let (Some(bytes), Some(view)) =
                     (bytes, self.browse.view.as_mut().filter(|v| v.cover_url.as_deref() == Some(url.as_str())))
-                    && let Ok(img) = image::load_from_memory(&bytes)
                 {
-                    let img = img.to_rgba8();
-                    let size = [img.width() as usize, img.height() as usize];
-                    view.cover = Some(self.ctx.load_texture(
-                        "collection-cover",
-                        egui::ColorImage::from_rgba_unmultiplied(size, img.as_raw()),
-                        egui::TextureOptions::LINEAR,
-                    ));
+                    view.cover = texture_from_image(&self.ctx, "collection-cover", &bytes);
                 }
+            }
+            UiMsg::PlaylistCover { id, bytes } => {
+                let texture = bytes.and_then(|b| texture_from_image(&self.ctx, &format!("playlist-cover-{id}"), &b));
+                self.browse.my_covers.insert(id, texture.map_or(CoverState::Failed, CoverState::Ready));
             }
             UiMsg::Login { generation, msg } => self.on_login(generation, msg),
             UiMsg::UpdateChecked { manual, result } => match result {
@@ -871,6 +869,13 @@ enum UpdateAction {
     Install,
     Skip(String),
     Later,
+}
+
+/// Decode a downloaded image into a texture (`None` when it is not an image).
+fn texture_from_image(ctx: &egui::Context, name: &str, bytes: &[u8]) -> Option<egui::TextureHandle> {
+    let img = image::load_from_memory(bytes).ok()?.to_rgba8();
+    let size = [img.width() as usize, img.height() as usize];
+    Some(ctx.load_texture(name, egui::ColorImage::from_rgba_unmultiplied(size, img.as_raw()), egui::TextureOptions::LINEAR))
 }
 
 pub fn apply_theme_preference(ctx: &egui::Context, theme: ncm_core::Theme) {
