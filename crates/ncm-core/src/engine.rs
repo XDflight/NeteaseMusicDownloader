@@ -1118,6 +1118,8 @@ mod tests {
         assert_eq!(pick_extension(&s), "m4a");
         s.url = Some("http://host/none".into());
         assert_eq!(pick_extension(&s), "mp3");
+        s.url = Some("http://m701.music.126.net/x/abc.aac?vuutv=1".into());
+        assert_eq!(pick_extension(&s), "aac");
     }
 
     #[test]

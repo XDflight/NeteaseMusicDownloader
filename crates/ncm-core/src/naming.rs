@@ -5,7 +5,10 @@ use std::path::{Path, PathBuf};
 use ncm_api::Track;
 use serde::{Deserialize, Serialize};
 
-pub const AUDIO_EXTENSIONS: [&str; 6] = ["mp3", "flac", "m4a", "wav", "ogg", "ape"];
+/// What counts as an audio file when looking for an existing copy of a song (and what a download
+/// address may end in). The service delivers mp3, flac and m4a, but the folder may hold the same song
+/// in a format it was converted to.
+pub const AUDIO_EXTENSIONS: &[&str] = &["mp3", "flac", "m4a", "aac", "wav", "ogg", "opus", "wma", "ape", "aiff", "aif", "wv"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -246,6 +249,35 @@ mod tests {
         assert_eq!(unique_base(&dir, "song"), "song (3)");
         assert_eq!(unique_base(&dir, "other"), "other");
         assert!(find_existing(&dir, "song").is_some());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn existing_files_are_found_in_any_common_audio_format() {
+        let dir = std::env::temp_dir().join(format!("ncm-formats-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        for ext in ["aac", "opus", "wma", "aiff", "wv", "mp3"] {
+            let base = format!("Song {ext}");
+            assert_eq!(find_existing(&dir, &base), None);
+            std::fs::write(dir.join(format!("{base}.{ext}")), b"audio").unwrap();
+            assert_eq!(find_existing(&dir, &base), Some(dir.join(format!("{base}.{ext}"))), ".{ext} is an audio file");
+        }
+
+        // A title that itself ends in something that looks like an extension: the real extension still
+        // comes last.
+        std::fs::write(dir.join("Intro.aac.flac"), b"audio").unwrap();
+        assert_eq!(find_existing(&dir, "Intro.aac"), Some(dir.join("Intro.aac.flac")));
+        assert_eq!(find_existing(&dir, "Intro"), None, "Intro.aac.flac is not a copy of Intro");
+
+        // Neither an empty file nor another kind of file is a song.
+        std::fs::write(dir.join("Empty.aac"), b"").unwrap();
+        std::fs::write(dir.join("Notes.txt"), b"text").unwrap();
+        std::fs::write(dir.join("Cover.jpg"), b"image").unwrap();
+        assert_eq!(find_existing(&dir, "Empty"), None);
+        assert_eq!(find_existing(&dir, "Notes"), None);
+        assert_eq!(find_existing(&dir, "Cover"), None);
         std::fs::remove_dir_all(&dir).ok();
     }
 }
