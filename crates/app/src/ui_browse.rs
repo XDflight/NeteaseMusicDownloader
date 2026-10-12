@@ -267,7 +267,9 @@ impl App {
 
         // Table.
         let view = self.browse.view.as_mut().expect("checked above");
-        track_table(ui, view, logged_in);
+        if track_table(ui, view, logged_in, &mut self.settings.track_columns) {
+            self.save_settings();
+        }
 
         if quality_changed {
             self.settings.download.level = level;
@@ -371,17 +373,60 @@ pub fn elide(ui: &egui::Ui, text: &str, font: FontId, color: Color32, width: f32
     ui.painter().layout_job(job)
 }
 
-fn track_table(ui: &mut egui::Ui, view: &mut CollectionView, logged_in: bool) {
+/// A flexible column of the track table is never dragged narrower than this.
+const MIN_COLUMN_PX: f32 = 70.0;
+
+/// Move the boundary right of flexible column `i` (0 = title, 1 = artist) by `dx` pixels in a region
+/// `flex` pixels wide: the column on its left grows by what the one on its right gives up, or the
+/// other way round. The shares keep adding up to 1 and neither column gets narrower than `MIN_COLUMN_PX`.
+fn drag_boundary(shares: &mut [f32; 3], i: usize, dx: f32, flex: f32) {
+    let min = (MIN_COLUMN_PX / flex).min(0.3);
+    let pair = shares[i] + shares[i + 1];
+    let left = (shares[i] + dx / flex).max(min).min((pair - min).max(min));
+    shares[i] = left;
+    shares[i + 1] = pair - left;
+}
+
+/// The track table. `columns` are the shares of the title, artist and album columns; dragging the
+/// dividers in the heading changes them (double-click restores the default). Returns `true` when a
+/// drag has just ended, so the caller can save the new widths.
+fn track_table(ui: &mut egui::Ui, view: &mut CollectionView, logged_in: bool, columns: &mut [f32; 3]) -> bool {
     let p = pal(ui);
     let total_w = ui.available_width();
     // Column layout: [check 34][# 44][title flex][artist][album][time 52][badge 70]
     let fixed = 34.0 + 44.0 + 52.0 + 76.0;
     let flex = (total_w - fixed - 24.0).max(240.0);
-    let (w_title, w_artist, w_album) = (flex * 0.40, flex * 0.28, flex * 0.32);
+    let widths = |c: &[f32; 3]| (flex * c[0], flex * c[1], flex * c[2]);
 
-    // Column headings.
+    // Column headings, with a draggable divider after the title and after the artist column.
     let (head, _) = ui.allocate_exact_size(Vec2::new(total_w, 26.0), Sense::hover());
     let hx = |x: f32| head.left() + x;
+    let mut resized = false;
+    {
+        let (w_title, w_artist, _) = widths(columns);
+        let dividers = [34.0 + 44.0 + w_title + 4.0, 34.0 + 44.0 + w_title + 8.0 + w_artist + 4.0];
+        for (i, x) in dividers.into_iter().enumerate() {
+            let grip = Rect::from_center_size(egui::pos2(hx(x), head.center().y), Vec2::new(12.0, head.height()));
+            let resp = ui
+                .interact(grip, egui::Id::new(("track-column-divider", i)), Sense::click_and_drag())
+                .on_hover_cursor(egui::CursorIcon::ResizeHorizontal)
+                .on_hover_text("拖动调整列宽，双击恢复默认");
+            if resp.dragged() {
+                drag_boundary(columns, i, resp.drag_delta().x, flex);
+            }
+            if resp.double_clicked() {
+                *columns = ncm_core::settings::DEFAULT_TRACK_COLUMNS;
+                resized = true;
+            }
+            resized |= resp.drag_stopped();
+            let hot = resp.hovered() || resp.dragged();
+            ui.painter().line_segment(
+                [egui::pos2(hx(x), head.center().y - 8.0), egui::pos2(hx(x), head.center().y + 8.0)],
+                Stroke::new(if hot { 2.0 } else { 1.0 }, if hot { ACCENT } else { p.line }),
+            );
+        }
+    }
+    let (w_title, w_artist, w_album) = widths(columns);
     let hy = head.center().y;
     let heading = |x: f32, text: &str| {
         ui.painter().text(egui::pos2(hx(x), hy), Align2::LEFT_CENTER, text, FontId::proportional(12.5), p.muted);
@@ -478,6 +523,7 @@ fn track_table(ui: &mut egui::Ui, view: &mut CollectionView, logged_in: bool) {
             }
         }
     });
+    resized
 }
 
 fn track_title(t: &Track) -> String {
@@ -498,7 +544,41 @@ fn availability_color(t: &Track, logged_in: bool) -> Option<Color32> {
 
 #[cfg(test)]
 mod tests {
-    use super::thumbnail_url;
+    use super::{MIN_COLUMN_PX, drag_boundary, thumbnail_url};
+
+    fn total(c: &[f32; 3]) -> f32 {
+        c.iter().sum()
+    }
+
+    #[test]
+    fn dragging_a_divider_moves_width_between_its_two_columns() {
+        let mut c = [0.40, 0.28, 0.32];
+        drag_boundary(&mut c, 0, 100.0, 1000.0);
+        assert!((c[0] - 0.50).abs() < 1e-6 && (c[1] - 0.18).abs() < 1e-6 && (c[2] - 0.32).abs() < 1e-6, "{c:?}");
+        drag_boundary(&mut c, 1, -50.0, 1000.0);
+        assert!((c[1] - 0.13).abs() < 1e-6 && (c[2] - 0.37).abs() < 1e-6 && (c[0] - 0.50).abs() < 1e-6, "{c:?}");
+        assert!((total(&c) - 1.0).abs() < 1e-6, "the shares keep adding up to one");
+    }
+
+    #[test]
+    fn a_column_cannot_be_dragged_below_the_minimum() {
+        let flex = 800.0;
+        let min = MIN_COLUMN_PX / flex;
+        let mut c = [0.40, 0.28, 0.32];
+        drag_boundary(&mut c, 0, 10_000.0, flex);
+        assert!((c[1] - min).abs() < 1e-6, "the right column stops at the minimum: {c:?}");
+        drag_boundary(&mut c, 0, -10_000.0, flex);
+        assert!((c[0] - min).abs() < 1e-6, "and so does the left one: {c:?}");
+        assert!((total(&c) - 1.0).abs() < 1e-6);
+        assert!((c[2] - 0.32).abs() < 1e-6, "the column on the other side is untouched");
+    }
+
+    #[test]
+    fn a_tiny_region_cannot_make_the_drag_panic() {
+        let mut c = [0.40, 0.28, 0.32];
+        drag_boundary(&mut c, 1, 5.0, 10.0);
+        assert!(c.iter().all(|v| v.is_finite() && *v > 0.0));
+    }
 
     #[test]
     fn thumbnails_replace_any_existing_size_parameter() {

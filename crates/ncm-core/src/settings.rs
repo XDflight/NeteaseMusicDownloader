@@ -77,6 +77,21 @@ impl Default for UpdateSettings {
     }
 }
 
+/// Relative widths of the title, artist and album columns of the track table.
+pub const DEFAULT_TRACK_COLUMNS: [f32; 3] = [0.40, 0.28, 0.32];
+
+/// Repair stored column widths: they have to be positive numbers that add up to 1, none of them
+/// vanishingly small (a column dragged to its minimum on a very wide window is a few percent);
+/// anything else means the default.
+pub fn normalize_track_columns(columns: [f32; 3]) -> [f32; 3] {
+    if columns.iter().any(|c| !c.is_finite() || *c <= 0.0) {
+        return DEFAULT_TRACK_COLUMNS;
+    }
+    let total: f32 = columns.iter().sum();
+    let shares = columns.map(|c| c / total);
+    if shares.iter().any(|c| *c < 0.01) { DEFAULT_TRACK_COLUMNS } else { shares }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -87,6 +102,8 @@ pub struct Settings {
     pub update: UpdateSettings,
     /// Ask before quitting while downloads are running.
     pub confirm_quit_while_downloading: bool,
+    /// Relative widths of the title, artist and album columns of the track table (they add up to 1).
+    pub track_columns: [f32; 3],
 }
 
 impl Default for Settings {
@@ -97,6 +114,7 @@ impl Default for Settings {
             theme: Theme::default(),
             update: UpdateSettings::default(),
             confirm_quit_while_downloading: true,
+            track_columns: DEFAULT_TRACK_COLUMNS,
         }
     }
 }
@@ -106,11 +124,16 @@ impl Settings {
         let file = paths.settings_file();
         match fs::read(&file) {
             // Editors such as Notepad add a UTF-8 byte-order mark, which JSON parsers reject.
-            Ok(bytes) => serde_json::from_slice(bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(&bytes)).unwrap_or_else(|e| {
-                tracing::warn!("settings unreadable ({e}); starting from defaults");
-                let _ = fs::rename(&file, file.with_extension("json.bak"));
-                Settings::default()
-            }),
+            Ok(bytes) => serde_json::from_slice::<Settings>(bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(&bytes))
+                .map(|mut s| {
+                    s.track_columns = normalize_track_columns(s.track_columns);
+                    s
+                })
+                .unwrap_or_else(|e| {
+                    tracing::warn!("settings unreadable ({e}); starting from defaults");
+                    let _ = fs::rename(&file, file.with_extension("json.bak"));
+                    Settings::default()
+                }),
             Err(_) => Settings::default(),
         }
     }
@@ -154,6 +177,21 @@ mod tests {
 
         fs::write(paths.settings_file(), br#"{"confirm_quit_while_downloading":false}"#).unwrap();
         assert!(!Settings::load(&paths).confirm_quit_while_downloading, "an explicit choice is kept");
+
+        // Column widths: kept when sane, repaired when not.
+        fs::write(paths.settings_file(), br#"{"track_columns":[2.0,1.0,1.0]}"#).unwrap();
+        assert_eq!(Settings::load(&paths).track_columns, [0.5, 0.25, 0.25]);
+        fs::write(paths.settings_file(), br#"{"track_columns":[1.0,0.0,1.0]}"#).unwrap();
+        assert_eq!(Settings::load(&paths).track_columns, DEFAULT_TRACK_COLUMNS);
+        // A narrow column is fine (the minimum is a fixed number of pixels, a small share of a wide window)...
+        fs::write(paths.settings_file(), br#"{"track_columns":[0.9,0.03,0.07]}"#).unwrap();
+        let kept = Settings::load(&paths).track_columns;
+        assert!(kept.iter().zip([0.9, 0.03, 0.07]).all(|(a, b)| (a - b).abs() < 1e-5), "{kept:?}");
+        // ...a sliver is not.
+        fs::write(paths.settings_file(), br#"{"track_columns":[0.99,0.005,0.005]}"#).unwrap();
+        assert_eq!(Settings::load(&paths).track_columns, DEFAULT_TRACK_COLUMNS);
+        fs::write(paths.settings_file(), br#"{"theme":"light"}"#).unwrap();
+        assert_eq!(Settings::load(&paths).track_columns, DEFAULT_TRACK_COLUMNS, "a file from before the setting existed");
 
         // A byte-order mark (Notepad, Windows PowerShell) must not make the file unreadable.
         let mut with_bom = b"\xEF\xBB\xBF".to_vec();
