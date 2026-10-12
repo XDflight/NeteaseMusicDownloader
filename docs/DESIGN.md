@@ -45,6 +45,12 @@ resolve URL (batched, cached) ──► chunked download to <name>.<ext>.part �
   start slot. The scheduler only starts tracks and builds the summary; collecting results after the
   last track had been started would leave early tracks looking busy until the whole batch is under
   way (`engine.rs`, `schedule`).
+* **Existing files are skipped first.** With the "skip" policy, the scheduler checks the whole batch
+  for files that already exist before it starts anything and reports those tracks as skipped at once.
+  They need no network, so they neither wait for a start slot behind running downloads nor for a pause
+  to end, and they are left out of the list of upcoming ids whose URLs are resolved together.
+  (A template that spells the delivered quality can only be checked once the server has said which
+  quality it gives; `run_track` checks again after resolving.)
 * **Pause.** `Engine::set_paused` stops the workers from taking a permit or a piece, drops the
   requests in flight and keeps the scheduler from starting tracks. A piece is only written once it
   is complete, so dropping a request loses nothing that was on disk; its bytes are taken back out of

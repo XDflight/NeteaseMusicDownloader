@@ -317,7 +317,11 @@ impl Inner {
                 async move { fetcher.wait_resumed().await }.boxed()
             })
         };
-        let summary = schedule(req.tracks, self.limiter.files.clone(), cancel, resumed, run, emit).await;
+        let early: EarlySkip = {
+            let ctx = ctx.clone();
+            Arc::new(move |job| existing_file(&ctx, job))
+        };
+        let summary = schedule(req.tracks, self.limiter.files.clone(), cancel, resumed, early, run, emit).await;
         let _ = self.tx.send(Event::BatchFinished { batch: id, summary });
     }
 
@@ -334,12 +338,10 @@ impl Inner {
         let requested = opts.level.as_str();
         let dir = naming::target_dir(opts.layout, &opts.output_dir, &name_ctx(job, &ctx.collection, requested));
 
-        // Cheap early exit that saves an API call.
-        if opts.on_exists == ExistsPolicy::Skip {
-            let pre = naming::render_template(&opts.filename_template, &name_ctx(job, &ctx.collection, requested));
-            if let Some(existing) = naming::find_existing(&dir, &pre) {
-                return Err(TrackError::Skipped(existing));
-            }
+        // The scheduler has already skipped what existed when the batch started; this catches a file
+        // that appeared since (an earlier track of the same batch) and saves an API call.
+        if let Some(existing) = existing_file(ctx, job) {
+            return Err(TrackError::Skipped(existing));
         }
 
         let mut song = self.resolve_song(ctx, track, upcoming, false).await?;
@@ -625,6 +627,8 @@ type RunTrack = Arc<dyn Fn(TrackJob, Vec<u64>) -> BoxFuture<'static, Result<Fini
 type Emit = Arc<dyn Fn(u64, TrackUpdate) + Send + Sync>;
 /// Completes when downloading is not paused.
 type Resumed = Arc<dyn Fn() -> BoxFuture<'static, ()> + Send + Sync>;
+/// The file that makes a track skippable without any network request, if there is one.
+type EarlySkip = Arc<dyn Fn(&TrackJob) -> Option<PathBuf> + Send + Sync>;
 
 /// How one track ended, for the batch summary.
 enum Outcome {
@@ -642,13 +646,39 @@ async fn schedule(
     slots: Arc<Gate>,
     cancel: CancellationToken,
     resumed: Resumed,
+    early: EarlySkip,
     run: RunTrack,
     emit: Emit,
 ) -> BatchSummary {
-    let all_ids: Vec<u64> = tracks.iter().map(|j| j.track.id).collect();
     let mut summary = BatchSummary { total: tracks.len(), ..BatchSummary::default() };
     let mut tasks: JoinSet<Outcome> = JoinSet::new();
-    let mut pending = tracks.into_iter().enumerate();
+
+    // Files that already exist are skipped right away, for the whole batch, before any track waits
+    // for a start slot (held by downloads that are still running) or for a pause to end. They need
+    // no network, so nothing is gained by letting them queue behind real downloads.
+    let found = {
+        let (jobs, early) = (tracks.clone(), early.clone());
+        tokio::task::spawn_blocking(move || {
+            jobs.iter().enumerate().filter_map(|(i, job)| early(job).map(|path| (i, path))).collect::<HashMap<_, _>>()
+        })
+        .await
+        .unwrap_or_default()
+    };
+    let mut todo = Vec::with_capacity(tracks.len() - found.len());
+    for (i, job) in tracks.into_iter().enumerate() {
+        match found.get(&i) {
+            Some(existing) => {
+                report(&emit, job.track.id, Err(TrackError::Skipped(existing.clone())));
+                summary.skipped += 1;
+            }
+            None => todo.push(job),
+        }
+    }
+
+    // The ids that follow a track are resolved together with it, so they must be the ones that
+    // will really be downloaded.
+    let all_ids: Vec<u64> = todo.iter().map(|j| j.track.id).collect();
+    let mut pending = todo.into_iter().enumerate();
 
     // A start slot is only handed out when the network can use it, and not while paused.
     for (pos, job) in pending.by_ref() {
@@ -714,6 +744,20 @@ fn report(emit: &Emit, track_id: u64, result: Result<Finished, TrackError>) -> O
             Outcome::Failed
         }
     }
+}
+
+/// With the "skip" policy: the file that already exists for this track, found from the options alone
+/// (no network). The name is built with the requested quality; a template that spells the delivered
+/// quality can only be checked once the server has said which one it gives.
+fn existing_file(ctx: &BatchCtx, job: &TrackJob) -> Option<PathBuf> {
+    let opts = &ctx.options;
+    if opts.on_exists != ExistsPolicy::Skip {
+        return None;
+    }
+    let requested = opts.level.as_str();
+    let dir = naming::target_dir(opts.layout, &opts.output_dir, &name_ctx(job, &ctx.collection, requested));
+    let name = naming::render_template(&opts.filename_template, &name_ctx(job, &ctx.collection, requested));
+    naming::find_existing(&dir, &name)
 }
 
 fn name_ctx<'a>(job: &'a TrackJob, collection: &'a str, quality: &'a str) -> NameContext<'a> {
@@ -799,6 +843,16 @@ mod tests {
         Arc::new(|| async {}.boxed())
     }
 
+    /// An `EarlySkip` that finds nothing.
+    fn none_exist() -> EarlySkip {
+        Arc::new(|_| None)
+    }
+
+    /// An `EarlySkip` for the given track ids.
+    fn existing(ids: &'static [u64]) -> EarlySkip {
+        Arc::new(move |job| ids.contains(&job.track.id).then(|| PathBuf::from(format!("{}.mp3", job.track.id))))
+    }
+
     fn label(update: &TrackUpdate) -> &'static str {
         match update {
             TrackUpdate::Done { .. } => "done",
@@ -830,7 +884,9 @@ mod tests {
             let log = log.clone();
             Arc::new(move |id, update| log.lock().unwrap().push(format!("{} {id}", label(&update))))
         };
-        let summary = schedule((1..=4).map(job).collect(), Gate::new(1), CancellationToken::new(), running(), run, emit).await;
+        let summary =
+            schedule((1..=4).map(job).collect(), Gate::new(1), CancellationToken::new(), running(), none_exist(), run, emit)
+                .await;
         assert_eq!(*log.lock().unwrap(), ["start 1", "done 1", "start 2", "done 2", "start 3", "done 3", "start 4", "done 4"]);
         assert_eq!((summary.total, summary.done, summary.bytes), (4, 4, 40));
     }
@@ -852,11 +908,130 @@ mod tests {
             let seen = seen.clone();
             Arc::new(move |id, update| seen.lock().unwrap().push((id, label(&update))))
         };
-        let s = schedule((1..=3).map(job).collect(), Gate::new(3), CancellationToken::new(), running(), run, emit).await;
+        let s = schedule((1..=3).map(job).collect(), Gate::new(3), CancellationToken::new(), running(), none_exist(), run, emit)
+            .await;
         assert_eq!((s.total, s.done, s.skipped, s.failed, s.cancelled), (3, 1, 1, 1, 0));
         let mut seen = seen.lock().unwrap().clone();
         seen.sort();
         assert_eq!(seen, [(1, "done"), (2, "skipped"), (3, "failed")]);
+    }
+
+    #[test]
+    fn an_existing_file_is_found_from_the_options_alone() {
+        use crate::naming::Layout;
+
+        let dir = std::env::temp_dir().join(format!("ncm-existing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ctx = |on_exists| {
+            let options =
+                DownloadOptions { output_dir: dir.clone(), layout: Layout::Flat, on_exists, ..DownloadOptions::default() };
+            BatchCtx {
+                id: 1,
+                collection: "list".into(),
+                collection_cover: None,
+                options,
+                cancel: CancellationToken::new(),
+                covers: Mutex::new(HashMap::new()),
+            }
+        };
+        let skipping = ctx(ExistsPolicy::Skip);
+        let track = job(7);
+        let name = naming::render_template(
+            &skipping.options.filename_template,
+            &name_ctx(&track, "list", skipping.options.level.as_str()),
+        );
+
+        assert_eq!(existing_file(&skipping, &track), None, "nothing there yet");
+        // An empty file is a failed download, not an existing song.
+        std::fs::write(dir.join(format!("{name}.flac")), b"").unwrap();
+        assert_eq!(existing_file(&skipping, &track), None);
+        std::fs::write(dir.join(format!("{name}.flac")), b"audio").unwrap();
+        assert_eq!(existing_file(&skipping, &track), Some(dir.join(format!("{name}.flac"))));
+
+        assert_eq!(existing_file(&ctx(ExistsPolicy::Overwrite), &track), None);
+        assert_eq!(existing_file(&ctx(ExistsPolicy::KeepBoth), &track), None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn existing_files_are_skipped_without_waiting_for_a_slot() {
+        // One start slot, held by track 2 until it is released. Tracks 1 and 3 exist: they must be
+        // reported at once instead of queueing behind the running download.
+        let release = Arc::new(tokio::sync::Notify::new());
+        let log = Arc::new(Mutex::new(Vec::<String>::new()));
+        let run: RunTrack = {
+            let (release, log) = (release.clone(), log.clone());
+            Arc::new(move |job, upcoming| {
+                let (release, log) = (release.clone(), log.clone());
+                async move {
+                    log.lock().unwrap().push(format!("start {} upcoming {upcoming:?}", job.track.id));
+                    if job.track.id == 2 {
+                        release.notified().await;
+                    }
+                    Ok(finished())
+                }
+                .boxed()
+            })
+        };
+        let emit: Emit = {
+            let log = log.clone();
+            Arc::new(move |id, update| log.lock().unwrap().push(format!("{} {id}", label(&update))))
+        };
+        let batch = tokio::spawn(schedule(
+            (1..=4).map(job).collect(),
+            Gate::new(1),
+            CancellationToken::new(),
+            running(),
+            existing(&[1, 3]),
+            run,
+            emit,
+        ));
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        {
+            let seen = log.lock().unwrap();
+            assert!(seen.contains(&"skipped 1".to_owned()), "{seen:?}");
+            assert!(seen.contains(&"skipped 3".to_owned()), "track 3 exists and must not wait for track 2: {seen:?}");
+            assert!(!seen.iter().any(|l| l.starts_with("done")), "{seen:?}");
+            // The ids to prefetch are the ones that will be downloaded: 3 is not among them.
+            assert!(seen.contains(&"start 2 upcoming [4]".to_owned()), "{seen:?}");
+        }
+        release.notify_one();
+        let s = batch.await.unwrap();
+        assert_eq!((s.total, s.done, s.skipped, s.failed), (4, 2, 2, 0));
+    }
+
+    #[tokio::test]
+    async fn existing_files_are_skipped_while_paused() {
+        let resumed: Resumed = Arc::new(|| std::future::pending::<()>().boxed());
+        let started = Arc::new(Mutex::new(Vec::<u64>::new()));
+        let run: RunTrack = {
+            let started = started.clone();
+            Arc::new(move |job, _| {
+                let started = started.clone();
+                async move {
+                    started.lock().unwrap().push(job.track.id);
+                    Ok(finished())
+                }
+                .boxed()
+            })
+        };
+        let seen = Arc::new(Mutex::new(Vec::<(u64, &'static str)>::new()));
+        let emit: Emit = {
+            let seen = seen.clone();
+            Arc::new(move |id, update| seen.lock().unwrap().push((id, label(&update))))
+        };
+        let cancel = CancellationToken::new();
+        let batch =
+            tokio::spawn(schedule((1..=2).map(job).collect(), Gate::new(2), cancel.clone(), resumed, existing(&[1]), run, emit));
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(*seen.lock().unwrap(), [(1, "skipped")], "the existing file does not wait for the pause to end");
+        assert!(started.lock().unwrap().is_empty());
+        cancel.cancel();
+        let s = batch.await.unwrap();
+        assert_eq!((s.total, s.skipped, s.cancelled), (2, 1, 1));
     }
 
     #[tokio::test]
@@ -886,8 +1061,15 @@ mod tests {
             })
         };
         let emit: Emit = Arc::new(|_, _| {});
-        let batch =
-            tokio::spawn(schedule((1..=2).map(job).collect(), Gate::new(2), CancellationToken::new(), resumed, run, emit));
+        let batch = tokio::spawn(schedule(
+            (1..=2).map(job).collect(),
+            Gate::new(2),
+            CancellationToken::new(),
+            resumed,
+            none_exist(),
+            run,
+            emit,
+        ));
 
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(started.lock().unwrap().is_empty(), "a paused batch must not start tracks");
@@ -916,7 +1098,8 @@ mod tests {
             let seen = seen.clone();
             Arc::new(move |id, update| seen.lock().unwrap().push((id, label(&update))))
         };
-        let batch = tokio::spawn(schedule((1..=3).map(job).collect(), Gate::new(1), cancel.clone(), running(), run, emit));
+        let batch =
+            tokio::spawn(schedule((1..=3).map(job).collect(), Gate::new(1), cancel.clone(), running(), none_exist(), run, emit));
         tokio::time::sleep(Duration::from_millis(30)).await;
         cancel.cancel();
         let s = batch.await.unwrap();
