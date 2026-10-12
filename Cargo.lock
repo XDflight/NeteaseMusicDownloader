@@ -151,7 +151,7 @@ checksum = "175571dd1d178ced59193a6fc02dde1b972eb0bc56c892cde9beeceac5bf0f6b"
 
 [[package]]
 name = "asset-tool"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "icns",
@@ -1971,7 +1971,7 @@ dependencies = [
 
 [[package]]
 name = "ncm-api"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "aes",
  "base64",
@@ -1994,7 +1994,7 @@ dependencies = [
 
 [[package]]
 name = "ncm-core"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -2020,7 +2020,7 @@ dependencies = [
 
 [[package]]
 name = "ncm-update"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "flate2",
  "futures-util",
@@ -2069,7 +2069,7 @@ dependencies = [
 
 [[package]]
 name = "netease-music-downloader"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "eframe",
  "egui-phosphor",
