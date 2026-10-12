@@ -192,8 +192,10 @@ impl App {
         if open_dir {
             self.open_download_folder();
         }
-        if let Some(path) = actions.reveal {
-            reveal_in_folder(&path);
+        if let Some(path) = actions.reveal
+            && let Err(e) = reveal_in_folder(&path)
+        {
+            self.toasts.push(ToastKind::Error, format!("无法在文件夹中显示：{e}"));
         }
     }
 
@@ -413,24 +415,57 @@ fn status_text(state: &QState, message: Option<&str>, muted: Color32, paused: bo
     }
 }
 
-pub fn reveal_in_folder(path: &Path) {
+/// Show `path` in the file manager with the file selected. When the file is gone (moved or deleted
+/// after the download), the folder that held it is shown instead, if that still exists.
+pub fn reveal_in_folder(path: &Path) -> Result<(), String> {
+    if !path.exists() {
+        return match path.parent().filter(|dir| dir.is_dir()) {
+            Some(dir) => open::that(dir).map_err(|e| e.to_string()),
+            None => Err("文件已被移动或删除".into()),
+        };
+    }
     #[cfg(target_os = "windows")]
     {
-        let _ = std::process::Command::new("explorer").arg(format!("/select,{}", path.display())).spawn();
+        use std::os::windows::process::CommandExt;
+        // raw_arg: the argument has to reach Explorer exactly as built, with only the path in quotes.
+        std::process::Command::new("explorer").raw_arg(explorer_select_arg(path)).spawn().map(drop).map_err(|e| e.to_string())
     }
     #[cfg(target_os = "macos")]
     {
-        let _ = std::process::Command::new("open").arg("-R").arg(path).spawn();
+        std::process::Command::new("open").arg("-R").arg(path).spawn().map(drop).map_err(|e| e.to_string())
     }
     #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
     {
-        let _ = open::that(path.parent().unwrap_or(path));
+        open::that(path.parent().unwrap_or(path)).map_err(|e| e.to_string())
     }
+}
+
+/// The command line argument that makes Explorer select `path`: `/select,"C:\a b\c.mp3"`. Explorer
+/// understands backslashes only, and the quotes must surround the path and not the whole argument,
+/// which is what an ordinary argument with a space in it would get. File names such as
+/// "歌手 - 歌名.mp3" always contain spaces.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn explorer_select_arg(path: &Path) -> String {
+    format!("/select,\"{}\"", path.to_string_lossy().replace('/', "\\"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explorer_gets_the_path_alone_in_quotes_with_backslashes() {
+        let arg = explorer_select_arg(Path::new("C:/Users/me/Music/NeteaseMusicDownloader\\热歌榜\\Max李玄 - 明知故犯.mp3"));
+        assert_eq!(arg, "/select,\"C:\\Users\\me\\Music\\NeteaseMusicDownloader\\热歌榜\\Max李玄 - 明知故犯.mp3\"");
+        // Not the whole argument in quotes, which Explorer does not understand.
+        assert!(!arg.starts_with('"'));
+    }
+
+    #[test]
+    fn a_missing_file_is_reported_when_its_folder_is_gone_too() {
+        let missing = std::env::temp_dir().join("ncm-no-such-folder").join("a.mp3");
+        assert_eq!(reveal_in_folder(&missing), Err("文件已被移动或删除".to_owned()));
+    }
 
     #[test]
     fn a_short_list_takes_only_what_it_needs() {
