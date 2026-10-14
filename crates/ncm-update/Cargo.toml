@@ -19,7 +19,7 @@ semver = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 
-zip = { version = "8", default-features = false, features = ["deflate"] }
+zip = { version = "9", default-features = false, features = ["deflate"] }
 tar = "0.4"
 flate2 = "1"
 self-replace = "1"
